@@ -1,0 +1,129 @@
+message(STATUS "[vAi] Configuring Python bindings...")
+
+################################################################################
+# Toolchain — Python + nanobind
+################################################################################
+if(CMAKE_VERSION VERSION_LESS 3.18)
+    set(DEV_MODULE Development)
+else()
+    set(DEV_MODULE Development.Module)
+endif()
+
+find_package(Python 3.9
+    COMPONENTS Interpreter ${DEV_MODULE}
+    REQUIRED
+)
+
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE nanobind_ROOT
+    RESULT_VARIABLE NB_RESULT
+    ERROR_QUIET
+)
+
+if(NOT NB_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "[vAi] nanobind not found in ${Python_EXECUTABLE}.\n"
+        "  Install with: \"${Python_EXECUTABLE}\" -m pip install nanobind\n"
+        "  (or re-run cmake with -DPython_EXECUTABLE=<path to python with nanobind installed>)"
+    )
+endif()
+
+find_package(nanobind CONFIG REQUIRED)
+
+message(STATUS "[vAi] Python  : ${Python_EXECUTABLE} (${Python_VERSION})")
+message(STATUS "[vAi] nanobind: ${nanobind_ROOT}")
+
+################################################################################
+# Package output — <build>/python/pyvai
+################################################################################
+# The importable package (extension + stub + pure-Python files) is assembled
+# here — import via `PYTHONPATH=<build>/python`. No wheel packaging in the
+# experimental release; pyproject.toml keeps the config for later.
+set(PYVAI_PACKAGE_DIR ${CMAKE_CURRENT_BINARY_DIR}/pyvai)
+
+################################################################################
+# Extension module (_pyvai)
+################################################################################
+file(GLOB_RECURSE PYVAI_SRCS
+    CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
+)
+
+nanobind_add_module(_pyvai
+    NB_STATIC
+    LTO        # link-time optimization on Release builds (no effect on Debug)
+    ${PYVAI_SRCS}
+)
+
+# models/... headers resolve via vAi's PUBLIC repo-root include dir; only the bindings' own tree needs adding.
+target_include_directories(_pyvai
+PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(_pyvai
+PRIVATE
+    vAi
+)
+
+set_target_properties(_pyvai PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${PYVAI_PACKAGE_DIR}"
+)
+
+# yolov8 — model-local shaders, compiled once under models/ (see models/CMakeLists.txt).
+add_dependencies(_pyvai yolov8-shaders)
+
+################################################################################
+# Package assembly — pure-Python files
+################################################################################
+# Copy the .py files (and py.typed) next to the extension — a complete
+# importable pyvai/ in the build tree. Per-file copy: incremental, and never
+# picks up dev leftovers (__pycache__ etc.).
+file(GLOB_RECURSE PYVAI_PY_FILES
+    CONFIGURE_DEPENDS
+    RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/pyvai
+    ${CMAKE_CURRENT_SOURCE_DIR}/pyvai/*.py
+)
+list(APPEND PYVAI_PY_FILES py.typed)
+
+set(PYVAI_PKG_OUTPUTS)
+foreach(REL_PATH ${PYVAI_PY_FILES})
+    add_custom_command(
+        OUTPUT ${PYVAI_PACKAGE_DIR}/${REL_PATH}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_CURRENT_SOURCE_DIR}/pyvai/${REL_PATH}
+                ${PYVAI_PACKAGE_DIR}/${REL_PATH}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/pyvai/${REL_PATH}
+    )
+    list(APPEND PYVAI_PKG_OUTPUTS ${PYVAI_PACKAGE_DIR}/${REL_PATH})
+endforeach()
+
+add_custom_target(pyvai-package ALL DEPENDS ${PYVAI_PKG_OUTPUTS})
+
+################################################################################
+# Type stub (_pyvai.pyi)
+################################################################################
+nanobind_add_stub(_pyvai_stub
+    MODULE _pyvai
+    OUTPUT ${PYVAI_PACKAGE_DIR}/_pyvai.pyi
+    PYTHON_PATH $<TARGET_FILE_DIR:_pyvai>
+    DEPENDS _pyvai
+)
+
+################################################################################
+# Install rules — pip install -e . (scikit-build-core)
+################################################################################
+# Active only when scikit-build-core drives the build (pip); direct CMake dev
+# builds ignore them. Pure-Python files come straight from the source tree
+# (pyproject wheel.packages), so only the extension + stub install here.
+if(SKBUILD)
+    install(TARGETS _pyvai LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME}
+            COMPONENT python)
+    install(FILES ${PYVAI_PACKAGE_DIR}/_pyvai.pyi
+            DESTINATION ${SKBUILD_PROJECT_NAME}
+            COMPONENT python)
+endif()
+
+message(STATUS "[vAi] Python bindings configuration completed.")

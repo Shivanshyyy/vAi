@@ -1,0 +1,117 @@
+/*=============================================================================
+ cm-transform.comp: one-time weight reorder into coopmat-fragment layout
+ for the cm-family GEMMs. MODE spec-constant selects the source layout:
+ Bindings: O=0, I=1.
+
+   MODE 0 (1x1)        bufferI_f16[Co, Ci] -> bufferO_f16[Co/16][Ci/16][16][16]
+   MODE 1 (Winograd U) U[36, Co, Ci]  -> Ut[36][Co/16][Ci/16][16][16]  (36 batch)
+   MODE 2 (3x3 s2)     bufferI_f16[Co, Ci, 3,3] -> bufferO_f16[Co/16][K'/16][16][16],
+                       K dim tap-major  k' = tap*Ci + ci,  tap = kh*3+kw  (K'=9Ci)
+   MODE 3 (3x3 s1)     same source and fragment layout, but K is channel-major:
+                       k' = ci*9 + tap. This keeps all nine taps of 16 input
+                       channels in one K=144 panel for implicit-GEMM input reuse.
+   MODE 4 (general)    bufferI_f16[Co,Ci,K,K] -> padded 16x16 fragment layout;
+                       Co and Ci*K*K tails are explicitly zero-filled.
+
+ Each 16x16 A-fragment becomes a contiguous 512B block (stride 16), so the
+ GEMM's coopMatLoad reads it linearly instead of scattering 16 rows over 16
+ cache lines. Runs once per node at first run() (bool-guarded).
+ Host guarantees Co % 16 == 0 and Ci % 16 == 0.
+
+ Scalar (one thread per output half) — the 3x3 source stride (9) has no
+ vectorized read, and unifying on scalar costs nothing here (one-time init,
+ not the inference hot path). Dispatch: dispatch2(batches * Co * K).
+=============================================================================*/
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint MODE = 0u;   // 0=1x1, 1=Winograd-U, 2/3=3x3, 4=general
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+float16_t readI(uint index)
+{
+    return bufferI_f16[index];
+}
+
+void writeO(uint index, float16_t value)
+{
+    bufferO_f16[index] = value;
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;            // half index into bufferO_f16
+
+    uint rawK     = MODE == 4u ? pc.ci * pc.kernel * pc.kernel
+                  : (MODE == 2u || MODE == 3u) ? pc.ci * 9u : pc.ci;
+    uint K        = MODE == 4u ? ((rawK + 15u) / 16u) * 16u : rawK;
+    uint M        = MODE == 4u ? ((pc.co + 15u) / 16u) * 16u : pc.co;
+    uint perBatch = M * K;                         // halfs per batch
+    uint batches  = (MODE == 1u) ? 36u : 1u;     // Winograd: 36 transform positions
+    if (index >= batches * perBatch)
+        return;
+
+    uint batch      = (MODE == 1u) ? index / perBatch : 0u;
+    uint batchIndex = index % perBatch;
+    uint tileIndex   = batchIndex >> 8u;                  // 16x16 = 256 halfs per tileIndex
+    uint elementInTile = batchIndex & 255u;
+    uint row    = elementInTile >> 4u;
+    uint col    = elementInTile & 15u;
+
+    uint kTiles = K >> 4u;
+    uint mTile     = tileIndex / kTiles;
+    uint kTile     = tileIndex % kTiles;
+
+    uint m = mTile * 16u + row;
+    uint k = kTile * 16u + col;
+
+    if (MODE == 4u && (m >= pc.co || k >= rawK))
+    {
+        writeO(index, float16_t(0.0));
+        return;
+    }
+
+    uint sourceIndex;
+    if (MODE == 4u)
+    {
+        uint taps = pc.kernel * pc.kernel;
+        uint ci = k / taps;
+        uint tap = k % taps;
+        sourceIndex = (m * pc.ci + ci) * taps + tap;
+    }
+    else if (MODE == 2u)
+    {
+        uint tap = k / pc.ci;                       // tap-major k' -> (tap, ci)
+        uint ci  = k % pc.ci;
+        sourceIndex = (m * pc.ci + ci) * 9u + tap;          // source [Co][Ci][kh][kw]
+    }
+    else if (MODE == 3u)
+    {
+        uint ci = k / 9u;                        // channel-major k' -> (ci, tap)
+        uint tap = k % 9u;
+        sourceIndex = (m * pc.ci + ci) * 9u + tap;
+    }
+    else
+    {
+        sourceIndex = batch * pc.co * pc.ci + m * pc.ci + k; // 1x1: batch=0; U: + batch (K=Ci)
+    }
+    writeO(index, readI(sourceIndex));
+}

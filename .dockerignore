@@ -1,0 +1,9 @@
+.git
+.github
+build/
+docs/
+mkdocs.yml
+
+data/
+
+**/__pycache__/

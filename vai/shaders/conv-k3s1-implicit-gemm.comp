@@ -1,0 +1,463 @@
+/*=============================================================================
+ K=3/S=1 non-cooperative implicit-GEMM variant.
+ Bindings: O=0, I=1, W=2, BIAS=3, SCALE=4, RESIDUAL=5.
+ Dispatch: x=pc.n tiles, y=pc.co tiles.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint wgSize = 128u;
+layout(constant_id = 1) const uint wgM = 64u;
+layout(constant_id = 2) const uint wgN = 32u;
+layout(constant_id = 3) const uint wgK = 8u;
+layout(constant_id = 4) const uint tM = 4u;
+layout(constant_id = 5) const bool alignM = false;
+layout(constant_id = 6) const bool alignN = false;
+layout(constant_id = 7) const bool alignK = false;
+layout(constant_id = 8) const bool shortcut = false;
+layout(constant_id = 9) const bool structuredInputLoad = false;
+layout(constant_id = 10) const bool padA = true;
+layout(constant_id = 11) const bool wideFp32Tile = false;
+layout(constant_id = SPEC_ID_TYPE_CI) const uint CI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_CO) const uint CO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HI) const uint HI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HO) const uint HO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WI) const uint WI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WO) const uint WO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F32 { float bufferW_f32[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_4F32 { vec4 bufferW_4f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_F32 { float bufferRes_f32[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_F16 { float16_t bufferRes_f16[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_4F32 { vec4 bufferRes_4f32[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint tN = 4u;
+const uint WIDE_A_LOAD_SLOTS =
+    wgM == 128u && wgN == 32u ? 4u : 3u;
+const uint WIDE_B_LOAD_SLOTS = 3u;
+const uint A_STRIDE = wgM + (padA ? 4u : 0u);
+const uint A_ELEMS = wgK * A_STRIDE;
+const uint B_ELEMS = wgK * wgN;
+
+shared float As32[typeW == DTYPE_F32 && !wideFp32Tile ? A_ELEMS : 1u];
+shared float Bs32[typeW == DTYPE_F32 && !wideFp32Tile ? B_ELEMS : 1u];
+shared float16_t As16[typeW == DTYPE_F16 ? A_ELEMS : 1u];
+shared float16_t Bs16[typeW == DTYPE_F16 ? B_ELEMS : 1u];
+shared float AsWide[wideFp32Tile ? 2u * wgK * wgM : 1u];
+shared vec4 BsWide[wideFp32Tile ? 2u * wgK * (wgN / 4u) : 1u];
+
+float readI(uint index) { return typeI == DTYPE_F32 ? bufferI_f32[index] : float(bufferI_f16[index]); }
+float readW(uint index) { return typeW == DTYPE_F32 ? bufferW_f32[index] : float(bufferW_f16[index]); }
+float readBias(uint channel)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[channel] : float(bufferBias_f16[channel]);
+}
+float readScale(uint channel) { return typeP == DTYPE_F32 ? bufferScale_f32[channel] : float(bufferScale_f16[channel]); }
+float readResidual(uint index) { return typeI == DTYPE_F32 ? bufferRes_f32[index] : float(bufferRes_f16[index]); }
+
+void writeO(uint index, float value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_f32[index] = value;
+    else
+        bufferO_f16[index] = float16_t(value);
+}
+
+void writeA(uint index, float value)
+{
+    if (typeW == DTYPE_F32) As32[index] = value;
+    else As16[index] = float16_t(value);
+}
+
+void writeB(uint index, float value)
+{
+    if (typeW == DTYPE_F32) Bs32[index] = value;
+    else Bs16[index] = float16_t(value);
+}
+
+float readA(uint index) { return typeW == DTYPE_F32 ? As32[index] : float(As16[index]); }
+float readB(uint index) { return typeW == DTYPE_F32 ? Bs32[index] : float(Bs16[index]); }
+
+float readK3S1InputAt(uint k, uint hOut, uint wOut, uint Hi, uint Wi, uint Ci)
+{
+    const uint channel = k / 9u;
+    const uint tap = k - channel * 9u;
+    const uint kh = tap / 3u;
+    const uint kw = tap - kh * 3u;
+    const int hIn = int(hOut + kh) - 1;
+    const int wIn = int(wOut + kw) - 1;
+    if ((!alignK && channel >= Ci) ||
+        hIn < 0 || wIn < 0 || hIn >= int(Hi) || wIn >= int(Wi))
+        return 0.0;
+    return readI((channel * Hi + uint(hIn)) * Wi + uint(wIn));
+}
+
+float finishOutput(uint channel, uint index, float value)
+{
+    value = hasScale == 0u
+        ? value + readBias(channel)
+        : fma(value, readScale(channel), readBias(channel));
+    value = applyEpilogue(value);
+    if (shortcut)
+        value += readResidual(index);
+    return value;
+}
+
+float readWideInput(
+    uint k, uint n, uint Hi, uint Wi, uint Ho, uint Wo, uint Ci)
+{
+    const uint N = Ho * Wo;
+    const bool validN = n < N;
+    const uint safeN = min(n, N - 1u);
+    const uint hOut = safeN / Wo;
+    const uint wOut = safeN - hOut * Wo;
+    const uint channel = k / 9u;
+    const uint tap = k - channel * 9u;
+    const uint kh = tap / 3u;
+    const uint kw = tap - kh * 3u;
+    const uint hIn = hOut + kh - 1u;
+    const uint wIn = wOut + kw - 1u;
+    const bool valid = validN && channel < Ci && hIn < Hi && wIn < Wi;
+    const uint safeChannel = min(channel, Ci - 1u);
+    const uint safeH = min(hIn, Hi - 1u);
+    const uint safeW = min(wIn, Wi - 1u);
+    const float value = bufferI_f32[(safeChannel * Hi + safeH) * Wi + safeW];
+    return valid ? value : 0.0;
+}
+
+void loadWidePanel(
+    uint kBase, uint mBase, uint nBase,
+    uint Hi, uint Wi, uint Ho, uint Wo, uint Ci,
+    out vec4 nextA[WIDE_A_LOAD_SLOTS],
+    out vec4 nextB[WIDE_B_LOAD_SLOTS])
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint weightVectorCount = wgK * wgM / 4u;
+    const uint weightLoads = weightVectorCount / wgSize;
+    [[unroll]]
+    for (uint load = 0u; load < WIDE_A_LOAD_SLOTS; ++load)
+    {
+        if (load >= weightLoads)
+            continue;
+        const uint weightVector = localId + load * wgSize;
+        const uint mLocal = weightVector / (wgK / 4u);
+        const uint kVec = weightVector - mLocal * (wgK / 4u);
+        const uint weightBase = (mBase + mLocal) * (Ci * 9u) + kBase;
+        nextA[load] = bufferW_4f32[weightBase / 4u + kVec];
+    }
+
+    const uint bVectorColumns = wgN / 4u;
+    const uint inputVectorCount = wgK * bVectorColumns;
+    const uint inputLoads = inputVectorCount / wgSize;
+    [[unroll]]
+    for (uint load = 0u; load < WIDE_B_LOAD_SLOTS; ++load)
+    {
+        if (load >= inputLoads)
+            continue;
+        const uint inputVector = localId + load * wgSize;
+        const uint kLocal = inputVector / bVectorColumns;
+        const uint nLocal =
+            (inputVector - kLocal * bVectorColumns) * 4u;
+        nextB[load] = vec4(
+            readWideInput(kBase + kLocal, nBase + nLocal, Hi, Wi, Ho, Wo, Ci),
+            readWideInput(kBase + kLocal, nBase + nLocal + 1u, Hi, Wi, Ho, Wo, Ci),
+            readWideInput(kBase + kLocal, nBase + nLocal + 2u, Hi, Wi, Ho, Wo, Ci),
+            readWideInput(kBase + kLocal, nBase + nLocal + 3u, Hi, Wi, Ho, Wo, Ci));
+    }
+}
+
+void storeWidePanel(
+    uint slot,
+    vec4 nextA[WIDE_A_LOAD_SLOTS], vec4 nextB[WIDE_B_LOAD_SLOTS])
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint weightVectorCount = wgK * wgM / 4u;
+    const uint weightLoads = weightVectorCount / wgSize;
+    const uint aBase = slot * wgK * wgM;
+    [[unroll]]
+    for (uint load = 0u; load < WIDE_A_LOAD_SLOTS; ++load)
+    {
+        if (load >= weightLoads)
+            continue;
+        const uint weightVector = localId + load * wgSize;
+        const uint mLocal = weightVector / (wgK / 4u);
+        const uint kLocal = (weightVector - mLocal * (wgK / 4u)) * 4u;
+        AsWide[aBase + kLocal * wgM + mLocal] = nextA[load].x;
+        AsWide[aBase + (kLocal + 1u) * wgM + mLocal] = nextA[load].y;
+        AsWide[aBase + (kLocal + 2u) * wgM + mLocal] = nextA[load].z;
+        AsWide[aBase + (kLocal + 3u) * wgM + mLocal] = nextA[load].w;
+    }
+
+    const uint bVectorColumns = wgN / 4u;
+    const uint inputVectorCount = wgK * bVectorColumns;
+    const uint inputLoads = inputVectorCount / wgSize;
+    [[unroll]]
+    for (uint load = 0u; load < WIDE_B_LOAD_SLOTS; ++load)
+    {
+        if (load >= inputLoads)
+            continue;
+        const uint inputVector = localId + load * wgSize;
+        const uint kLocal = inputVector / bVectorColumns;
+        const uint nVector = inputVector - kLocal * bVectorColumns;
+        BsWide[slot * wgK * bVectorColumns +
+               kLocal * bVectorColumns + nVector] = nextB[load];
+    }
+}
+
+vec4 finishWideOutput(uint channel, uint outputIndex, vec4 value)
+{
+    const float bias = (hasBias != 0u ? bufferBias_f32[channel] : 0.0);
+    value = hasScale == 0u
+        ? value + vec4(bias)
+        : fma(value, vec4(bufferScale_f32[channel]), vec4(bias));
+    value = applyEpilogue(value);
+    if (shortcut)
+        value += bufferRes_4f32[outputIndex / 4u];
+    return value;
+}
+
+void runWideFp32(uint Hi, uint Wi, uint Ho, uint Wo, uint Ci, uint Co)
+{
+    const uint N = Ho * Wo;
+    const uint localId = gl_LocalInvocationID.x;
+    const uint mBase = gl_WorkGroupID.y * wgM;
+    const uint nBase = gl_WorkGroupID.x * wgN;
+    const uint nThreadTiles = wgN / 8u;
+    const uint threadN = localId % nThreadTiles;
+    const uint threadM = localId / nThreadTiles;
+    const uint m0 = mBase + threadM * 8u;
+    const uint n0 = nBase + threadN * 8u;
+    const uint kTileCount = (Ci * 9u) / wgK;
+    const uint bVectorColumns = wgN / 4u;
+
+    vec4 acc[16];
+    [[unroll]]
+    for (uint index = 0u; index < 16u; ++index)
+        acc[index] = vec4(0.0);
+
+    vec4 nextA[WIDE_A_LOAD_SLOTS];
+    vec4 nextB[WIDE_B_LOAD_SLOTS];
+    loadWidePanel(0u, mBase, nBase, Hi, Wi, Ho, Wo, Ci, nextA, nextB);
+    storeWidePanel(0u, nextA, nextB);
+    barrier();
+
+    [[dont_unroll]]
+    for (uint kTile = 0u; kTile < kTileCount; ++kTile)
+    {
+        const uint slot = kTile & 1u;
+        const bool hasNext = kTile + 1u < kTileCount;
+        if (hasNext)
+            loadWidePanel(
+                (kTile + 1u) * wgK, mBase, nBase,
+                Hi, Wi, Ho, Wo, Ci, nextA, nextB);
+
+        const uint aBase = slot * wgK * wgM;
+        const uint bBase = slot * wgK * bVectorColumns;
+        [[unroll]]
+        for (uint kLocal = 0u; kLocal < wgK; ++kLocal)
+        {
+            const uint b = bBase + kLocal * bVectorColumns + threadN * 2u;
+            const vec4 input0 = BsWide[b];
+            const vec4 input1 = BsWide[b + 1u];
+            const uint a = aBase + kLocal * wgM + threadM * 8u;
+            [[unroll]]
+            for (uint tm = 0u; tm < 8u; ++tm)
+            {
+                const float weight = AsWide[a + tm];
+                acc[tm * 2u] = fma(vec4(weight), input0, acc[tm * 2u]);
+                acc[tm * 2u + 1u] = fma(vec4(weight), input1, acc[tm * 2u + 1u]);
+            }
+        }
+
+        if (hasNext)
+        {
+            storeWidePanel(slot ^ 1u, nextA, nextB);
+            barrier();
+        }
+    }
+
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+    {
+        const uint channel = m0 + tm;
+        [[unroll]]
+        for (uint group = 0u; group < 2u; ++group)
+        {
+            const uint n = n0 + group * 4u;
+            if (channel < Co && n < N)
+            {
+                const uint outputIndex = channel * N + n;
+                bufferO_4f32[outputIndex / 4u] = finishWideOutput(
+                    channel, outputIndex, acc[tm * 2u + group]);
+            }
+        }
+    }
+}
+
+void main()
+{
+    const uint Hi = HI_SPEC != 0u ? HI_SPEC : pc.hi;
+    const uint Wi = WI_SPEC != 0u ? WI_SPEC : pc.wi;
+    const uint Ho = HO_SPEC != 0u ? HO_SPEC : pc.ho;
+    const uint Wo = WO_SPEC != 0u ? WO_SPEC : pc.wo;
+    const uint Ci = CI_SPEC != 0u ? CI_SPEC : pc.ci;
+    const uint Co = CO_SPEC != 0u ? CO_SPEC : pc.co;
+    const uint N = Ho * Wo;
+    const uint KK = Ci * 9u;
+    const uint localId = gl_LocalInvocationID.x;
+    const uint threadsN = wgN / tN;
+    const uint threadN = localId % threadsN;
+    const uint threadM = localId / threadsN;
+    const uint mBase = gl_WorkGroupID.y * wgM;
+    const uint nBase = gl_WorkGroupID.x * wgN;
+
+    if (wideFp32Tile)
+    {
+        runWideFp32(Hi, Wi, Ho, Wo, Ci, Co);
+        return;
+    }
+
+    // For linear loads, a thread keeps the same N coordinate when wgSize
+    // is a multiple of wgN: (localId + j * wgSize) % wgN == localId % wgN.
+    const bool cacheInputCoords = !structuredInputLoad && (wgSize % wgN) == 0u;
+    const uint inputN = cacheInputCoords ? nBase + localId % wgN : 0u;
+    const bool inputValidN = alignN || inputN < N;
+    const uint inputHOut = cacheInputCoords && inputValidN ? inputN / Wo : 0u;
+    const uint inputWOut = cacheInputCoords && inputValidN ? inputN - inputHOut * Wo : 0u;
+
+    vec4 acc[8];
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+        if (tm < tM) acc[tm] = vec4(0.0);
+
+    const uint kTileCount = alignK
+        ? KK / wgK
+        : KK / wgK + (KK % wgK != 0u ? 1u : 0u);
+    for (uint kTile = 0u; kTile < kTileCount; ++kTile)
+    {
+        const uint kBase = kTile * wgK;
+        for (uint index = localId; index < wgK * wgM; index += wgSize)
+        {
+            const uint mLocal = index / wgK;
+            const uint kLocal = index - mLocal * wgK;
+            const uint k = kBase + kLocal;
+            const uint m = mBase + mLocal;
+            writeA(kLocal * A_STRIDE + mLocal,
+                   (alignK || k < KK) && (alignM || m < Co)
+                       ? readW(m * KK + k)
+                       : 0.0);
+        }
+        // Merging this tile-scoped traversal with the linear loop regressed
+        // RTX 5070 Ti FP32 kernels; keep its generated code independent.
+        if (structuredInputLoad)
+        {
+            const uint nLocal = localId % wgN;
+            const uint n = nBase + nLocal;
+            const bool validN = alignN || n < N;
+            const uint hOut = validN ? n / Wo : 0u;
+            const uint wOut = validN ? n - hOut * Wo : 0u;
+            const uint firstKLocal = localId / wgN;
+            const uint kStride = wgSize / wgN;
+            for (uint kLocal = firstKLocal; kLocal < wgK; kLocal += kStride)
+            {
+                const uint k = kBase + kLocal;
+                writeB(kLocal * wgN + nLocal, (alignK || k < KK) && validN
+                    ? readK3S1InputAt(k, hOut, wOut, Hi, Wi, Ci)
+                    : 0.0);
+            }
+        }
+        else
+        {
+            for (uint index = localId; index < wgK * wgN; index += wgSize)
+            {
+                const uint kLocal = index / wgN;
+                const uint nLocal = index - kLocal * wgN;
+                const uint k = kBase + kLocal;
+                const uint n = nBase + nLocal;
+                float value = 0.0;
+                if ((alignK || k < KK) && (alignN || n < N))
+                {
+                    const uint hOut = cacheInputCoords ? inputHOut : n / Wo;
+                    const uint wOut = cacheInputCoords ? inputWOut : n - hOut * Wo;
+                    value = readK3S1InputAt(k, hOut, wOut, Hi, Wi, Ci);
+                }
+                writeB(index, value);
+            }
+        }
+        barrier();
+
+        const uint aColumn = threadM * tM;
+        const uint bColumn = threadN * tN;
+        for (uint kLocal = 0u;
+             kLocal < wgK && (alignK || kBase + kLocal < KK);
+             ++kLocal)
+        {
+            const uint a = kLocal * A_STRIDE + aColumn;
+            const uint b = kLocal * wgN + bColumn;
+            const vec4 inputVector = vec4(
+                readB(b), readB(b + 1u), readB(b + 2u), readB(b + 3u));
+            [[unroll]]
+            for (uint tm = 0u; tm < 8u; ++tm)
+                if (tm < tM) acc[tm] += readA(a + tm) * inputVector;
+        }
+        barrier();
+    }
+
+    const uint m0 = mBase + threadM * tM;
+    const uint n0 = nBase + threadN * tN;
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+    {
+        const uint m = m0 + tm;
+        if (tm >= tM || (!alignM && m >= Co) || (!alignN && n0 >= N))
+            continue;
+        const uint validColumns = alignN ? 4u : min(4u, N - n0);
+        [[unroll]]
+        for (uint tn = 0u; tn < 4u; ++tn)
+        {
+            const uint n = n0 + tn;
+            if (alignN || tn < validColumns)
+            {
+                const uint outputIndex = m * N + n;
+                writeO(outputIndex, finishOutput(m, outputIndex, acc[tm][tn]));
+            }
+        }
+    }
+}

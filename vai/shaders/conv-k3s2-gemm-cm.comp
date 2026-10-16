@@ -1,0 +1,812 @@
+/*=============================================================================
+ Unified FP16 cooperative-matrix K=3/S=2 GEMM convolution.
+ packedLayout selects transformed packed weights; false uses direct weights.
+ Bindings: O=0, I=1, W=2, BIAS=3, SCALE=4.
+ Dispatch: x=N tiles, y=M tiles, z=split count for both layouts.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint wgSize = 128u;
+layout(constant_id = 1) const uint wgM = 128u;
+layout(constant_id = 2) const uint wgN = 64u;
+layout(constant_id = 3) const uint sgM = 16u;
+layout(constant_id = 4) const uint sgN = 16u;
+layout(constant_id = 5) const uint splitK = 1u;
+layout(constant_id = 6) const bool alignM = true;
+layout(constant_id = 7) const bool alignN = false;
+layout(constant_id = 8) const bool alignK = true;
+layout(constant_id = 9) const bool packedLayout = false;
+layout(constant_id = 10) const bool directOutput = false;
+layout(constant_id = SPEC_ID_TYPE_CI) const uint CI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_CO) const uint CO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HI) const uint HI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HO) const uint HO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WI) const uint WI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WO) const uint WO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_TYPE_ACC) const uint typeAcc = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint tM = 16u, tN = 16u, tK = 16u;
+const uint sgSize = 32u;
+const uint sgCount = wgSize / sgSize;
+const uint sgMCount = wgM / sgM;
+const uint sgNCount = wgN / sgN;
+const uint sgpMIter = sgM / tM;
+const uint sgpNIter = sgN / tN;
+const uint accFrags = sgpMIter * sgpNIter;
+const uint CM_TILE_ELEMS = tM * tN;
+const bool SPLIT = splitK > 1u;
+
+// Packed cooperative-matrix preset.
+const uint PACKED_TAPS_PER_SPLIT = 9u / splitK + (9u % splitK != 0u ? 1u : 0u);
+const uint B_PAD = 8u;
+const uint PACKED_SHARED_STRIDE = wgN + B_PAD;
+const uint PACKED_BS_SIZE = tK * PACKED_SHARED_STRIDE;
+// Packed plans guarantee that N columns divide the workgroup and the
+// resulting K-thread count divides the 16-row cooperative-matrix tile.
+const uint K_THREADS = wgSize / wgN;
+const uint ROWS_PER_THREAD = tK / K_THREADS;
+
+const uint BS_BUFFER_COUNT = packedLayout ? 2u : 1u;
+const uint BS_BUFFER_SIZE =
+    packedLayout ? PACKED_BS_SIZE : tK * wgN;
+const uint CS_SIZE =
+    packedLayout
+        ? (directOutput ? 1u : wgM * wgN)
+        : 2u * sgCount * CM_TILE_ELEMS;
+
+shared float16_t Bs[BS_BUFFER_COUNT][BS_BUFFER_SIZE];
+shared float16_t Cs[CS_SIZE];
+
+#define matA     coopmat<float16_t, gl_ScopeSubgroup, tM, tK, gl_MatrixUseA>
+#define matB     coopmat<float16_t, gl_ScopeSubgroup, tK, tN, gl_MatrixUseB>
+#define accMat16 coopmat<float16_t, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+#define accMat32 coopmat<float, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+
+float16_t readI(uint i) { return typeI == DTYPE_F32 ? float16_t(bufferI_f32[i]) : bufferI_f16[i]; }
+float readBias(uint m)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[m] : float(bufferBias_f16[m]);
+}
+float readScale(uint m) { return typeP == DTYPE_F32 ? bufferScale_f32[m] : float(bufferScale_f16[m]); }
+
+void writeO(uint i, float value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_f32[i] = value;
+    else
+        bufferO_f16[i] = float16_t(value);
+}
+
+void writeO4(uint i, vec4 value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_4f32[i] = value;
+    else
+        bufferO_4f16[i] = f16vec4(value);
+}
+
+vec4 applyOutput(uint m, vec4 value)
+{
+    value = hasScale == 0u
+        ? value + vec4(readBias(m))
+        : fma(value, vec4(readScale(m)), vec4(readBias(m)));
+    return applyEpilogue(value);
+}
+
+void writeOutputRow4(uint base, uint n0, uint N, vec4 value)
+{
+    if (!alignN && n0 >= N)
+        return;
+    uint remaining = alignN ? 4u : N - n0;
+    if (alignN || (remaining >= 4u && (base & 3u) == 0u))
+    {
+        writeO4(base >> 2u, value);
+    }
+    else
+    {
+        writeO(base, value.x);
+        if (remaining > 1u) writeO(base + 1u, value.y);
+        if (remaining > 2u) writeO(base + 2u, value.z);
+        if (remaining > 3u) writeO(base + 3u, value.w);
+    }
+}
+
+void directWriteTilePair(
+    accMat32 acc0,
+    accMat32 acc1,
+    uint m0,
+    uint n0,
+    uint n1,
+    uint splitId,
+    bool finalPair,
+    uint Co,
+    uint N)
+{
+    uint lane = gl_SubgroupInvocationID;
+    uint tileBase0 = gl_SubgroupID * (2u * CM_TILE_ELEMS);
+    uint tileBase1 = tileBase0 + CM_TILE_ELEMS;
+    accMat16 storeAcc0 = accMat16(acc0);
+    accMat16 storeAcc1 = accMat16(acc1);
+    coopMatStore(storeAcc0, Cs, tileBase0, tN, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(storeAcc1, Cs, tileBase1, tN, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    const uint vecsPerRow = tN >> 2u;
+    uint partialOffset = splitId * Co * N;
+    for (uint vecIdx = lane;
+         vecIdx < CM_TILE_ELEMS / 4u;
+         vecIdx += gl_SubgroupSize)
+    {
+        uint row = vecIdx / vecsPerRow;
+        uint col = (vecIdx % vecsPerRow) * 4u;
+        uint m = m0 + row;
+        uint out0 = n0 + col;
+        uint out1 = n1 + col;
+        uint shared0 = tileBase0 + row * tN + col;
+        uint shared1 = tileBase1 + row * tN + col;
+        vec4 value0 = vec4(
+            Cs[shared0],
+            Cs[shared0 + 1u],
+            Cs[shared0 + 2u],
+            Cs[shared0 + 3u]);
+        vec4 value1 = vec4(
+            Cs[shared1],
+            Cs[shared1 + 1u],
+            Cs[shared1 + 2u],
+            Cs[shared1 + 3u]);
+        writeOutputRow4(
+            partialOffset + m * N + out0,
+            out0,
+            N,
+            value0);
+        writeOutputRow4(
+            partialOffset + m * N + out1,
+            out1,
+            N,
+            value1);
+    }
+
+    if (!finalPair)
+    {
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+}
+
+void directWriteTile(accMat32 acc, uint m0, uint n0, uint N)
+{
+    uint lane = gl_SubgroupInvocationID;
+    uint tileBase = gl_SubgroupID * CM_TILE_ELEMS;
+    accMat16 storeAcc = accMat16(acc);
+    coopMatStore(storeAcc, Cs, tileBase, tN, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    const uint vecsPerRow = tN >> 2u;
+    for (uint vecIdx = lane; vecIdx < CM_TILE_ELEMS / 4u; vecIdx += gl_SubgroupSize)
+    {
+        uint row = vecIdx / vecsPerRow;
+        uint col = (vecIdx % vecsPerRow) * 4u;
+        uint base = tileBase + row * tN + col;
+        uint m = m0 + row;
+        uint n = n0 + col;
+        vec4 v = vec4(
+            Cs[base],
+            Cs[base + 1u],
+            Cs[base + 2u],
+            Cs[base + 3u]);
+        writeOutputRow4(
+            m * N + n,
+            n,
+            N,
+            applyOutput(m, v));
+    }
+
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+void decomposeK3(uint k, out uint c, out uint kh, out uint kw)
+{
+    c = k / 9u;
+    uint r = k % 9u;
+    kh = r / 3u;
+    kw = r % 3u;
+}
+
+
+float16_t directReadRowAlignedInput(uint tileCol, uint k, uint col, uint Hi, uint Wi, uint Wo)
+{
+    uint tilesPerRow = Wo / wgN;
+    uint tileH0 = tileCol / tilesPerRow;
+    uint tileX = tileCol % tilesPerRow;
+    uint tileW0 = tileX * wgN;
+    uint hOut = tileH0;
+    uint wOut = tileW0 + col;
+
+    uint c, kh, kw;
+    decomposeK3(k, c, kh, kw);
+
+    const uint tileWLast = tileW0 + wgN - 1u;
+    const bool interiorTile =
+        hOut > 0u && hOut * 2u + 1u < Hi &&
+        tileW0 > 0u && tileWLast * 2u + 1u < Wi;
+    if (interiorTile)
+    {
+        uint hIn = hOut * 2u + kh - 1u;
+        uint wIn = wOut * 2u + kw - 1u;
+        return readI((c * Hi + hIn) * Wi + wIn);
+    }
+
+    int hIn = int(hOut * 2u) + (int(kh) - 1);
+    int wIn = int(wOut * 2u) + (int(kw) - 1);
+    if (uint(hIn) < Hi && uint(wIn) < Wi)
+        return readI((c * Hi + uint(hIn)) * Wi + uint(wIn));
+    return float16_t(0.0);
+}
+
+void runDirect(uint Hi, uint Wi, uint Ho, uint Wo, uint Ci, uint Co, uint N, uint KK)
+{
+    uint tileCol = gl_WorkGroupID.x;
+    uint tileRow = gl_WorkGroupID.y;
+    uint subgroup = gl_SubgroupID;
+    uint splitId = gl_WorkGroupID.z;
+    uint nBase = tileCol * wgN;
+    uint m0;
+    uint bTileBase = 0u;
+    uint kStart = 0u;
+    uint directKPerSplit = KK / splitK;
+    uint kCount = KK;
+    // N is always flattened as hOut * Wo + wOut. When a workgroup tile
+    // divides one output row, WO_SPEC lets the compiler retain only this
+    // cheaper row-aligned address path.
+    bool rowAligned = (Wo % wgN) == 0u;
+
+    if (SPLIT)
+    {
+        kStart = splitId * directKPerSplit;
+        kCount = directKPerSplit;
+    }
+
+    uint subgroupIdM = subgroup / sgNCount;
+    uint subgroupIdN = subgroup % sgNCount;
+    m0 = tileRow * wgM + subgroupIdM * sgM;
+    bTileBase = subgroupIdN * sgpNIter;
+
+    matA a[2];
+    matB b[4];
+    accMat32 acc[4];
+    [[unroll]]
+    for (uint i = 0u; i < 4u; ++i)
+        if (i < accFrags)
+            acc[i] = accMat32(0.0);
+
+    for (uint k0 = 0u; k0 < kCount; k0 += tK)
+    {
+        uint kBase = kStart + k0;
+        const uint elementCount = tK * wgN;
+        const uint iterCount = elementCount / gl_WorkGroupSize.x +
+            (elementCount % gl_WorkGroupSize.x != 0u ? 1u : 0u);
+
+        [[unroll]]
+        for (uint iter = 0u; iter < iterCount; ++iter)
+        {
+            uint fill = gl_LocalInvocationID.x + iter * gl_WorkGroupSize.x;
+            if (fill < elementCount)
+            {
+                uint kk = fill / wgN;
+                uint col = fill % wgN;
+                uint k = kBase + kk;
+
+                float16_t bVal = float16_t(0.0);
+                if (rowAligned)
+                {
+                    bVal = directReadRowAlignedInput(tileCol, k, col, Hi, Wi, Wo);
+                }
+                else
+                {
+                    uint n = nBase + col;
+                    if (alignN || n < N)
+                    {
+                        uint hOut = n / Wo;
+                        uint wOut = n % Wo;
+
+                        uint c, kh, kw;
+                        decomposeK3(k, c, kh, kw);
+                        int hIn = int(hOut * 2u) + (int(kh) - 1);
+                        int wIn = int(wOut * 2u) + (int(kw) - 1);
+
+                        if (uint(hIn) < Hi && uint(wIn) < Wi)
+                            bVal = readI((c * Hi + uint(hIn)) * Wi + uint(wIn));
+                    }
+                }
+                Bs[0][fill] = bVal;
+            }
+        }
+        barrier();
+
+        [[unroll]]
+        for (uint nTile = 0u; nTile < 4u; ++nTile)
+            if (nTile < sgpNIter)
+                coopMatLoad(b[nTile], Bs[0], (bTileBase + nTile) * tN, wgN, gl_CooperativeMatrixLayoutRowMajor);
+
+        [[unroll]]
+        for (uint mTile = 0u; mTile < 2u; ++mTile)
+        {
+            if (mTile < sgpMIter)
+            {
+                coopMatLoad(a[mTile], bufferW_f16, (m0 + mTile * tM) * KK + kBase, KK, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]]
+                for (uint nTile = 0u; nTile < 4u; ++nTile)
+                {
+                    if (nTile < sgpNIter)
+                    {
+                        uint accIndex = mTile * sgpNIter + nTile;
+                        acc[accIndex] = coopMatMulAdd(a[mTile], b[nTile], acc[accIndex]);
+                    }
+                }
+            }
+        }
+
+        if (k0 + tK < kCount)
+            barrier();
+    }
+
+    if (SPLIT)
+    {
+        directWriteTilePair(
+            acc[0], acc[1], m0,
+            nBase, nBase + tN,
+            splitId, false, Co, N);
+        directWriteTilePair(
+            acc[2], acc[3], m0,
+            nBase + 2u * tN, nBase + 3u * tN,
+            splitId, true, Co, N);
+        return;
+    }
+
+    [[unroll]]
+    for (uint mTile = 0u; mTile < 2u; ++mTile)
+    {
+        if (mTile < sgpMIter)
+        {
+            [[unroll]]
+            for (uint nTile = 0u; nTile < 4u; ++nTile)
+            {
+                if (nTile < sgpNIter)
+                {
+                    uint accIndex = mTile * sgpNIter + nTile;
+                    directWriteTile(
+                        acc[accIndex],
+                        m0 + mTile * tM,
+                        nBase + (bTileBase + nTile) * tN,
+                        N);
+                }
+            }
+        }
+    }
+}
+
+void packedWriteBs(uint buf, uint row0, uint col, const in float16_t src[ROWS_PER_THREAD])
+{
+    for (uint e = 0u; e < ROWS_PER_THREAD; ++e)
+    {
+        uint row = row0 + e * K_THREADS;
+        Bs[buf][row * PACKED_SHARED_STRIDE + col] = src[e];
+    }
+    if (sgCount == 1u)
+    {
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+    else
+    {
+        barrier();
+    }
+}
+
+
+void packedGather(
+    uint chunk,
+    uint ciTiles,
+    uint hOut,
+    uint wBase,
+    uint Hi,
+    uint Wi,
+    uint hOutLane,
+    uint wOutLane,
+    uint row0,
+    uint col,
+    bool rowAligned,
+    bool outputLaneValid,
+    out float16_t dst[ROWS_PER_THREAD],
+    out bool valid)
+{
+    uint tap = chunk / ciTiles;
+    uint ct = chunk % ciTiles;
+    uint kh = tap / 3u;
+    uint kw = tap % 3u;
+    if (!rowAligned)
+    {
+        valid = true;
+        for (uint e = 0u; e < ROWS_PER_THREAD; ++e)
+        {
+            uint row = row0 + e * K_THREADS;
+            int hIn = int(hOutLane * 2u) + (int(kh) - 1);
+            int wIn = int(wOutLane * 2u) + (int(kw) - 1);
+            dst[e] = float16_t(0.0);
+            if (outputLaneValid &&
+                uint(hIn) < Hi && uint(wIn) < Wi)
+                dst[e] = readI(
+                    ((ct * 16u + row) * Hi + uint(hIn)) * Wi +
+                    uint(wIn));
+        }
+    }
+    else
+    {
+        int hIn = int(hOut * 2u) + (int(kh) - 1);
+        valid = hIn >= 0 && hIn < int(Hi);
+        int wOffset = int(2u * wBase) + (int(kw) - 1);
+        bool leftPad = wOffset < 0;
+        bool rightPad =
+            wOffset + 2 * int(wgN - 1u) >= int(Wi);
+        uint rowBase = uint(max(hIn, 0)) * Wi;
+        int wIn = wOffset + int(2u * col);
+        for (uint e = 0u; e < ROWS_PER_THREAD; ++e)
+        {
+            uint row = row0 + e * K_THREADS;
+            dst[e] = float16_t(0.0);
+            if (outputLaneValid && valid &&
+                !(leftPad && col == 0u) &&
+                !(rightPad && wIn >= int(Wi)))
+            {
+                dst[e] = readI(
+                    (ct * 16u + row) * Hi * Wi +
+                    rowBase + uint(wIn));
+            }
+        }
+    }
+}
+
+void packedWriteFragmentDirect16(
+    accMat16 acc,
+    uint m0,
+    uint n0,
+    uint splitId,
+    uint Co,
+    uint N)
+{
+    const uint lane = gl_SubgroupInvocationID;
+    const uint n = n0 + (lane & 15u);
+    if (n >= N)
+        return;
+
+    const uint mBase = m0 + (lane >> 4u) * 8u;
+    const uint partialOffset = splitId * Co * N;
+    [[unroll]]
+    for (uint element = 0u; element < 8u; ++element)
+    {
+        const uint m = mBase + element;
+        const float value = float(acc[element]);
+        if (SPLIT)
+            bufferO_f16[partialOffset + m * N + n] = float16_t(value);
+        else
+            writeO(m * N + n, applyOutput(m, vec4(value)).x);
+    }
+}
+
+void packedWriteFragmentDirect32(
+    inout accMat32 acc,
+    uint m0,
+    uint n0,
+    uint splitId,
+    uint Co,
+    uint N)
+{
+    if (n0 >= N)
+        return;
+
+    if (!SPLIT)
+    {
+        accMat32 biasValues;
+        if (hasBias == 0u)
+            biasValues = accMat32(0.0);
+        else if (typeP == DTYPE_F32)
+            coopMatLoad(
+                biasValues, bufferBias_f32, m0, 0u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        else
+        {
+            accMat16 biasValuesF16;
+            coopMatLoad(
+                biasValuesF16, bufferBias_f16, m0, 0u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            biasValues = accMat32(biasValuesF16);
+        }
+
+        accMat32 scaleValues;
+        if (hasScale != 0u)
+        {
+            if (typeP == DTYPE_F32)
+                coopMatLoad(
+                    scaleValues, bufferScale_f32, m0, 0u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+            else
+            {
+                accMat16 scaleValuesF16;
+                coopMatLoad(
+                    scaleValuesF16, bufferScale_f16, m0, 0u,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+                scaleValues = accMat32(scaleValuesF16);
+            }
+        }
+
+        [[unroll]]
+        for (int element = 0; element < acc.length(); ++element)
+        {
+            const float value = hasScale == 0u
+                ? acc[element] + biasValues[element]
+                : fma(acc[element], scaleValues[element], biasValues[element]);
+            acc[element] = applyEpilogue(value);
+        }
+    }
+
+    const uint outputBase =
+        (SPLIT ? splitId * Co * N : 0u) + m0 * N + n0;
+    if (!SPLIT && typeO == DTYPE_F32)
+        coopMatStore(
+            acc, bufferO_f32, outputBase, N,
+            gl_CooperativeMatrixLayoutRowMajor);
+    else
+    {
+        accMat16 outputValues = accMat16(acc);
+        coopMatStore(
+            outputValues, bufferO_f16, outputBase, N,
+            gl_CooperativeMatrixLayoutRowMajor);
+    }
+}
+
+void runPacked(uint Hi, uint Wi, uint Ho, uint Wo, uint Ci, uint Co, uint N)
+{
+    bool rowAligned = (Wo % wgN) == 0u;
+    uint tilesPerRow = rowAligned ? Wo / wgN : 0u;
+    uint subgroup     = gl_SubgroupID;
+    uint lane    = gl_SubgroupInvocationID;
+    uint wgMId   = gl_WorkGroupID.y;
+    uint wgNId   = gl_WorkGroupID.x;
+    uint workgroupM = wgMId * wgM;
+    uint nBase = wgNId * wgN;
+    uint hOut = 0u, wBase = 0u;
+    if (rowAligned)
+    {
+        hOut    = wgNId / tilesPerRow;
+        uint wTile = wgNId % tilesPerRow;
+        wBase = wTile * wgN;
+    }
+    uint subgroupM   = workgroupM + subgroup * sgM;
+
+    uint tapStart = SPLIT ? gl_WorkGroupID.z * PACKED_TAPS_PER_SPLIT : 0u;
+    uint tapEnd   = SPLIT ? min(tapStart + PACKED_TAPS_PER_SPLIT, 9u) : 9u;
+
+    accMat16 acc16[accFrags];
+    accMat32 acc32[accFrags];
+    for (uint i = 0; i < accFrags; ++i)
+    {
+        if (typeAcc == DTYPE_F32)
+            acc16[i] = accMat16(0.0);
+        else
+            acc32[i] = accMat32(0.0);
+    }
+
+    uint kTiles  = (Ci * 9u) >> 4u; // A tiles along K'
+    uint ciTiles = Ci >> 4u;         // K chunks per tap
+    uint aRow0   = (subgroupM >> 4u) * kTiles;
+    uint tid     = gl_LocalInvocationID.x;
+    uint row0    = tid / wgN;
+    uint col     = tid % wgN;
+
+    uint chunkStart = tapStart * ciTiles;
+    uint chunkEnd   = tapEnd * ciTiles;
+
+    uint hOutLane = 0u;
+    uint wOutLane = 0u;
+    if (!rowAligned)
+    {
+        uint nLane = nBase + col;
+        hOutLane = nLane / Wo;
+        wOutLane = nLane % Wo;
+    }
+    bool outputLaneValid =
+        rowAligned || nBase + col < N;
+
+    float16_t gx[ROWS_PER_THREAD];
+    bool gxValid;
+    uint bBuf = 0u;
+    packedGather(
+        chunkStart, ciTiles, hOut, wBase, Hi, Wi,
+        hOutLane, wOutLane, row0, col, rowAligned, outputLaneValid,
+        gx, gxValid);
+    packedWriteBs(bBuf, row0, col, gx);
+    bool curValid = gxValid;
+
+    for (uint chunk = chunkStart; chunk < chunkEnd; ++chunk)
+    {
+        if (chunk + 1u < chunkEnd)
+            packedGather(
+                chunk + 1u, ciTiles, hOut, wBase, Hi, Wi,
+                hOutLane, wOutLane, row0, col, rowAligned, outputLaneValid,
+                gx, gxValid);
+
+        if (curValid)
+        {
+            matA a[sgpMIter];
+            for (uint r = 0; r < sgpMIter; ++r)
+                coopMatLoad(a[r], bufferW_f16, (aRow0 + r * kTiles + chunk) << 8u, tK, gl_CooperativeMatrixLayoutRowMajor);
+
+            for (uint i = 0; i < sgpNIter; ++i)
+            {
+                matB b;
+                coopMatLoad(b, Bs[bBuf], i * tN, PACKED_SHARED_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint r = 0; r < sgpMIter; ++r)
+                {
+                    const uint accIndex = r * sgpNIter + i;
+                    if (typeAcc == DTYPE_F32)
+                        acc16[accIndex] = coopMatMulAdd(
+                            a[r], b, acc16[accIndex]);
+                    else
+                        acc32[accIndex] = coopMatMulAdd(
+                            a[r], b, acc32[accIndex]);
+                }
+            }
+        }
+
+        if (chunk + 1u < chunkEnd)
+        {
+            bBuf ^= 1u;
+            packedWriteBs(bBuf, row0, col, gx);
+            curValid = gxValid;
+        }
+    }
+    if (directOutput)
+    {
+        for (uint r = 0u; r < sgpMIter; ++r)
+        {
+            for (uint i = 0u; i < sgpNIter; ++i)
+            {
+                const uint accIndex = r * sgpNIter + i;
+                const uint m0 = subgroupM + r * tM;
+                const uint n0 = nBase + i * tN;
+                if (typeAcc == DTYPE_F32)
+                    packedWriteFragmentDirect16(
+                        acc16[accIndex], m0, n0,
+                        gl_WorkGroupID.z, Co, N);
+                else
+                    packedWriteFragmentDirect32(
+                        acc32[accIndex], m0, n0,
+                        gl_WorkGroupID.z, Co, N);
+            }
+        }
+        return;
+    }
+
+    uint sharedCBase  = subgroup * sgM * wgN;
+    for (uint r = 0; r < sgpMIter; ++r)
+    {
+        for (uint i = 0; i < sgpNIter; ++i)
+        {
+            const uint accIndex = r * sgpNIter + i;
+            const uint sharedIndex =
+                sharedCBase + r * tM * wgN + i * tN;
+            if (typeAcc == DTYPE_F32)
+            {
+                coopMatStore(
+                    acc16[accIndex], Cs, sharedIndex, wgN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+            else
+            {
+                coopMatStore(
+                    accMat16(acc32[accIndex]), Cs, sharedIndex, wgN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint vectorCount = (sgM * sgN) >> 2u;
+    if (SPLIT)
+    {
+        uint partialBase = gl_WorkGroupID.z * Co * N;
+        for (uint e4 = lane; e4 < vectorCount; e4 += sgSize)
+        {
+            uint e   = e4 << 2u;
+            uint m   = subgroupM + e / wgN;
+            uint localCol = e % wgN;
+            uint col = nBase + localCol;
+            uint cs  = sharedCBase + e;
+            bool validOutput = rowAligned || col + 3u < N;
+            if (!validOutput)
+                continue;
+            bufferO_4f16[(partialBase + m * N + col) >> 2u] =
+                f16vec4(Cs[cs], Cs[cs + 1u], Cs[cs + 2u], Cs[cs + 3u]);
+        }
+    }
+    else
+    {
+        for (uint e4 = lane; e4 < vectorCount; e4 += sgSize)
+        {
+            uint e   = e4 << 2u;
+            uint m   = subgroupM + e / wgN;
+            uint localCol = e % wgN;
+            uint col = nBase + localCol;
+            uint cs  = sharedCBase + e;
+            bool validOutput = rowAligned || col + 3u < N;
+            if (!validOutput)
+                continue;
+            vec4 v = vec4(float(Cs[cs]), float(Cs[cs + 1u]),
+                          float(Cs[cs + 2u]), float(Cs[cs + 3u]));
+            writeO4((m * N + col) >> 2u, applyOutput(m, v));
+        }
+    }
+}
+void main()
+{
+    uint Hi = HI_SPEC != 0u ? HI_SPEC : pc.hi;
+    uint Wi = WI_SPEC != 0u ? WI_SPEC : pc.wi;
+    uint Ho = HO_SPEC != 0u ? HO_SPEC : pc.ho;
+    uint Wo = WO_SPEC != 0u ? WO_SPEC : pc.wo;
+    uint Ci = CI_SPEC != 0u ? CI_SPEC : pc.ci;
+    uint Co = CO_SPEC != 0u ? CO_SPEC : pc.co;
+    uint N = Ho * Wo;
+    uint KK = Ci * 9u;
+
+    if (packedLayout)
+        runPacked(Hi, Wi, Ho, Wo, Ci, Co, N);
+    else
+        runDirect(Hi, Wi, Ho, Wo, Ci, Co, N, KK);
+}

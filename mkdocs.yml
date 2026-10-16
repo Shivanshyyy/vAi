@@ -1,0 +1,156 @@
+site_name: vAi                                  # 탭 제목 · 좌상단 로고 옆 이름
+site_description: 그래프 DSL 기반 Vulkan 추론 엔진   # <meta description> — 검색엔진·SNS 미리보기
+repo_url: https://github.com/OWNER/vAi          # 우상단 저장소 링크 (OWNER 확정 필요)
+repo_name: vAi                                  # 그 링크에 보일 텍스트
+edit_uri: edit/master/docs/                     # "이 페이지 편집" 버튼이 향할 경로
+
+theme:
+  name: material
+  # UI 문구 언어는 i18n 플러그인이 로케일마다 바꿔 끼운다 (여기서 고정하지 않는다).
+  features:
+    # navigation.instant 은 켜지 않는다 — 켜면 헤더의 언어 선택기가 "지금 보는
+    # 페이지의 다른 언어판" 이 아니라 그 언어의 첫 페이지로만 갈 수 있다
+    # (i18n 플러그인이 빌드 때 경고로 알려준다). 문맥 유지가 더 중요하다.
+    - navigation.tracking                       # 스크롤에 맞춰 주소창 앵커 갱신
+    - navigation.top                            # "맨 위로" 버튼
+    - navigation.indexes                        # 섹션 제목 자체에 페이지를 붙일 수 있게 (nav 참조)
+    - content.code.copy                         # 코드블록 복사 버튼
+    # content.action.edit 은 켜지 않는다 — 페이지마다 GitHub 편집 화면으로 가는
+    # 연필 버튼이 붙는데, repo_url 이 아직 OWNER placeholder 라서 없는 주소로
+    # 간다. repo_url 이 확정되고 외부 기여를 받을 때 다시 켤 것.
+    - search.suggest                            # 검색어 자동완성
+  # 팔레트는 한 벌뿐이다 — website/DESIGN.md 는 다크 캔버스 전용이고
+  # 라이트 팔레트를 "Known Gap" 으로 남겨 두었다(브랜드 잉크색 ember 가
+  # 흰 바탕에서 2.9:1). 없는 팔레트를 여기서 발명하지 않으므로 토글도 없다.
+  # custom 은 색을 테마에서 고르지 않고 extra.css 가 정한다는 뜻이다.
+  palette:
+    scheme: slate
+    primary: custom
+    accent: custom
+
+  # 테마가 Google Fonts 에서 Roboto 를 받아오지 않게 끈다.
+  # 서체는 extra.css 가 저장소 안의 Archivo 로 지정한다.
+  font: false
+
+# 좌측 메뉴의 순서와 이름. 언어는 여기서 가르지 않는다 — 두 언어가 각자
+# 자기 nav 를 최상위로 가지고, 전환은 헤더 우측의 언어 선택기가 한다
+# (아래 plugins 의 i18n). 이 nav 는 기본 로케일(ko)의 것이고, 영어 nav 는
+# i18n 의 languages[locale: en].nav 에 있다.
+#
+# 두 언어는 파일이 1:1로 대응한다. 한쪽에 장을 추가하면 다른 쪽도 같이 고칠 것.
+nav:
+  - 개요: ko/index.md
+  - 빠른 실행: ko/02-quickstart.md
+  - vAi 사용법:
+      - ko/03-usage/README.md                   # 이름 없이 두면 섹션 제목을 눌렀을 때 열릴 페이지가 된다
+      - 노드(Node): ko/03-usage/node.md
+      - 노드그룹(NodeGroup): ko/03-usage/node-group.md
+      - 신경망(NeuralNet): ko/03-usage/neural-net.md
+      - 텐서(Tensor): ko/03-usage/tensor.md
+      - 실행 파이프라인 요약: ko/03-usage/execution-pipeline.md
+      - 프로파일링: ko/03-usage/profiling.md
+  - 제공 모델:
+      - ko/04-models/README.md
+      - YOLOv8: ko/04-models/yolov8.md
+      - YOLOX: ko/04-models/yolox.md
+      - GPT-2: ko/04-models/gpt2.md
+      - Llama 3: ko/04-models/llama3.md
+  - 커스텀 모델 작성: ko/05-contributing-models.md
+  - 제공 노드들: ko/06-nodes.md
+  - 커스텀 노드와 커널 작성: ko/07-contributing-nodes.md
+
+# docs/ 아래 파일은 nav 에 없어도 페이지가 만들어지고 검색에도 걸린다.
+# 문서는 전부 공개하고, 숨길 것만 적는다 (.gitignore 문법).
+# internals 는 내부 문서, tools 와 requirements.txt 는 빌드 기계 장치다.
+exclude_docs: |
+  /internals/
+  /tools/
+  /requirements.txt
+
+# 테마 위에 얹는 스타일. 문서 소스는 건드리지 않는다.
+extra_css:
+  - assets/extra.css
+
+markdown_extensions:
+  - admonition                                  # !!! note 강조 박스
+  - attr_list                                   # 요소에 {: .class } 로 속성 부여
+  - md_in_html                                  # HTML 태그 안의 마크다운도 처리
+  - tables                                      # 표
+
+  # 기본 slugify 는 유니코드를 버려서 한글 헤딩이 _1, _2 가 된다.
+  # GitHub 은 한글 앵커를 그대로 만들므로 양쪽을 맞추려면 이 slugify 가 필요하다.
+  - toc:
+      permalink: true                           # 제목 옆 ¶ 링크
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+
+  - pymdownx.details                            # ??? 로 접히는 블록
+  - pymdownx.superfences:                       # 코드블록 중첩 허용
+      custom_fences:
+        # ```mermaid 를 코드가 아니라 다이어그램으로 렌더
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true                     # 줄 번호마다 링크 가능한 앵커
+  - pymdownx.inlinehilite                       # 인라인 코드에도 문법 강조
+  - pymdownx.snippets                           # --8<-- 로 다른 파일 조각 삽입
+
+plugins:
+  # 전문 검색 (결과물에 색인이 함께 생성됨). lang 은 적지 않는다 — i18n 이
+  # 로케일마다 색인을 다시 만들면서 그 언어에 맞는 lang 을 끼워 넣는다.
+  - search
+
+  # 언어별로 사이트를 한 번씩 빌드한다. docs/ko 는 사이트 루트(/), docs/en 은
+  # /en/ 아래로 들어가고, 헤더 우측에 두 언어를 오가는 선택기가 생긴다.
+  # 폴더 이름이 곧 로케일 코드라서 kor/eng 가 아니라 ko/en 이어야 한다.
+  #
+  # 기본 로케일을 영어로 바꾸려면 default: true 를 en 으로 옮기고 nav 두 벌의
+  # 위치를 맞바꾼다 (루트 nav 가 기본 로케일의 것이다).
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: ko
+          name: 한국어
+          default: true
+        - locale: en
+          name: English
+          nav:
+            - Overview: en/index.md
+            - Quickstart: en/02-quickstart.md
+            - Using vAi:
+                - en/03-usage/README.md
+                - Node: en/03-usage/node.md
+                - NodeGroup: en/03-usage/node-group.md
+                - NeuralNet: en/03-usage/neural-net.md
+                - Tensor: en/03-usage/tensor.md
+                - Execution pipeline summary: en/03-usage/execution-pipeline.md
+                - Profiling: en/03-usage/profiling.md
+            - Supported models:
+                - en/04-models/README.md
+                - YOLOv8: en/04-models/yolov8.md
+                - YOLOX: en/04-models/yolox.md
+                - GPT-2: en/04-models/gpt2.md
+                - Llama 3: en/04-models/llama3.md
+            - Writing custom models: en/05-contributing-models.md
+            - Built-in nodes: en/06-nodes.md
+            - Writing custom nodes and kernels: en/07-contributing-nodes.md
+
+# 빌드마다 6장을 헤더 스탬프에서 다시 만든다.
+hooks:
+  - docs/tools/mkdocs_hook.py
+
+# hook 이 돌려면 빌드가 일어나야 한다. serve 가 노드 헤더 변경도 감지하도록.
+# docs/ 와 mkdocs.yml 은 기본 감시 대상이라 적지 않는다.
+watch:
+  - vai/nodes
+
+# 문서는 GitHub 에서 읽는 것이 1차, 사이트가 2차다. ../vai, ../models 로 나가는
+# 링크는 GitHub 에서는 정상이지만 사이트에는 대상이 없어 not_found 가 뜬다.
+# repo_url 이 확정되면 절대 URL 로 바꾸고 이 예외를 없앨 것.
+validation:
+  links:
+    not_found: ignore
+  nav:
+    omitted_files: ignore                       # nav 에 없는 문서가 있어도 경고하지 않음

@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="960" height="540"
+     font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img"
+     aria-label="세 개의 Linear 노드가 KVCacheAttention 노드의 Q, K, V 슬롯으로 연결된 그래프">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#14556b"/>
+    </marker>
+    <style>
+      .box   { fill: #9fd3e8; stroke: #111; stroke-width: 2.5; }
+      .title { font-size: 21px; font-weight: 600; fill: #000; text-anchor: middle; }
+      .hl    { fill: #22e0e0; }
+      .slot  { font-size: 17px; fill: #000; }
+      .wire  { stroke: #14556b; stroke-width: 2.5; stroke-dasharray: 9 7; fill: none; }
+      .in    { fill: #f5b301; stroke: #111; stroke-width: 1.5; }
+      .out   { fill: #ee5fc0; stroke: #111; stroke-width: 1.5; }
+      .ded   { fill: #14556b; stroke: #111; stroke-width: 1.5; }
+
+      /* 박스 밖 글자는 페이지 배경 위에 놓인다 — 테마를 따라간다. */
+      .cap      { font-size: 18px; font-weight: 600; fill: #111; }
+      .cap-item { font-size: 17px; fill: #111; }
+      @media (prefers-color-scheme: dark) {
+        .cap, .cap-item { fill: #d7dde3; }
+      }
+    </style>
+  </defs>
+
+  <!-- ── Linear (Q projection) ── -->
+  <rect class="box" x="140" y="20" width="220" height="150" rx="14"/>
+  <rect class="hl" x="196" y="35" width="108" height="24"/>
+  <text class="title" x="250" y="54">Linear</text>
+  <circle class="in"  cx="162" cy="88"  r="7"/><text class="slot" x="178" y="94">in0</text>
+  <circle class="ded" cx="162" cy="120" r="7"/><text class="slot" x="178" y="126">weight</text>
+  <circle class="ded" cx="162" cy="152" r="7"/><text class="slot" x="178" y="158">bias</text>
+  <circle class="out" cx="338" cy="88"  r="7"/>
+  <text class="slot" x="322" y="94" text-anchor="end">out0</text>
+
+  <!-- ── Linear (K projection) ── -->
+  <rect class="box" x="140" y="195" width="220" height="150" rx="14"/>
+  <rect class="hl" x="196" y="210" width="108" height="24"/>
+  <text class="title" x="250" y="229">Linear</text>
+  <circle class="in"  cx="162" cy="263" r="7"/><text class="slot" x="178" y="269">in0</text>
+  <circle class="ded" cx="162" cy="295" r="7"/><text class="slot" x="178" y="301">weight</text>
+  <circle class="ded" cx="162" cy="327" r="7"/><text class="slot" x="178" y="333">bias</text>
+  <circle class="out" cx="338" cy="263" r="7"/>
+  <text class="slot" x="322" y="269" text-anchor="end">out0</text>
+
+  <!-- ── Linear (V projection) ── -->
+  <rect class="box" x="140" y="370" width="220" height="150" rx="14"/>
+  <rect class="hl" x="196" y="385" width="108" height="24"/>
+  <text class="title" x="250" y="404">Linear</text>
+  <circle class="in"  cx="162" cy="438" r="7"/><text class="slot" x="178" y="444">in0</text>
+  <circle class="ded" cx="162" cy="470" r="7"/><text class="slot" x="178" y="476">weight</text>
+  <circle class="ded" cx="162" cy="502" r="7"/><text class="slot" x="178" y="508">bias</text>
+  <circle class="out" cx="338" cy="438" r="7"/>
+  <text class="slot" x="322" y="444" text-anchor="end">out0</text>
+
+  <!-- ── KVCacheAttention ── -->
+  <rect class="box" x="620" y="140" width="240" height="250" rx="14"/>
+  <rect class="hl" x="638" y="157" width="204" height="24"/>
+  <text class="title" x="740" y="176">KVCacheAttention</text>
+  <circle class="in"  cx="642" cy="212" r="7"/><text class="slot" x="658" y="218">Q</text>
+  <circle class="in"  cx="642" cy="248" r="7"/><text class="slot" x="658" y="254">K</text>
+  <circle class="in"  cx="642" cy="284" r="7"/><text class="slot" x="658" y="290">V</text>
+  <circle class="ded" cx="642" cy="320" r="7"/><text class="slot" x="658" y="326">K_cache</text>
+  <circle class="ded" cx="642" cy="356" r="7"/><text class="slot" x="658" y="362">V_cache</text>
+  <circle class="out" cx="838" cy="212" r="7"/>
+  <text class="slot" x="822" y="218" text-anchor="end">out0</text>
+
+  <!-- ── 외부 입력 ── -->
+  <path class="wire" marker-end="url(#arrow)" d="M 20 130 L 150 90"/>
+  <path class="wire" marker-end="url(#arrow)" d="M 20 263 L 150 263"/>
+  <path class="wire" marker-end="url(#arrow)" d="M 20 396 L 150 436"/>
+
+  <!-- ── out0 → Q / K / V ── -->
+  <path class="wire" marker-end="url(#arrow)" d="M 348 88  L 630 210"/>
+  <path class="wire" marker-end="url(#arrow)" d="M 348 263 L 630 248"/>
+  <path class="wire" marker-end="url(#arrow)" d="M 348 438 L 630 288"/>
+
+  <!-- ── 출력 ── -->
+  <path class="wire" marker-end="url(#arrow)" d="M 848 212 L 950 212"/>
+
+  <!-- ── 범례 ── -->
+  <text class="cap" x="626" y="440">Slot 의 타입:</text>
+  <circle class="in"  cx="640" cy="468" r="7"/>
+  <text class="cap-item" x="658" y="474">input</text>
+  <circle class="out" cx="640" cy="496" r="7"/>
+  <text class="cap-item" x="658" y="502">output</text>
+  <circle class="ded" cx="640" cy="524" r="7"/>
+  <text class="cap-item" x="658" y="530">persistent</text>
+</svg>

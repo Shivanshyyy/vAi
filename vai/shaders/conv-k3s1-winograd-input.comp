@@ -1,0 +1,325 @@
+/*=============================================================================
+ Unified Winograd F(4,3) input stage.
+  Input : 6×6
+  filter: 3×3
+  Output: 4×4
+ typeW selects transform precision; typeI selects input storage.
+ Bindings: O=0, I=1.
+ Dispatch covers pc.ci*Winograd tiles.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/spec_constants.h"
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = 3) const bool tileMajor = false;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const float16_t H2 = float16_t(2.0);
+const float16_t H4 = float16_t(4.0);
+const float16_t H5 = float16_t(5.0);
+const uint WINOGRAD_SIZE = 6u;
+
+uint transformedIndex(
+    uint transform,
+    uint ci,
+    uint numTiles,
+    uint c,
+    uint tileIdx)
+{
+    if (!tileMajor)
+        return transform * ci * numTiles + c * numTiles + tileIdx;
+
+    const uint kTiles = ci >> 4u;
+    const uint nTiles = numTiles / 16u + (numTiles % 16u != 0u ? 1u : 0u);
+    const uint tile =
+        ((transform * kTiles + (c >> 4u)) * nTiles +
+         (tileIdx >> 4u)) << 8u;
+    return tile + (c & 15u) * 16u + (tileIdx & 15u);
+}
+
+void writeTransformed(
+    uint transform, uint ci, uint numTiles,
+    uint c, uint tileIdx, float value)
+{
+    bufferO_f32[
+        transformedIndex(transform, ci, numTiles, c, tileIdx)] = value;
+}
+
+void writeTransformed(
+    uint transform, uint ci, uint numTiles,
+    uint c, uint tileIdx, float16_t value)
+{
+    bufferO_f16[
+        transformedIndex(transform, ci, numTiles, c, tileIdx)] = value;
+}
+
+float readInputF(int h, int w, uint c, uint hi, uint wi)
+{
+    if (uint(h) >= hi || uint(w) >= wi)
+        return 0.0;
+
+    uint index = (c * hi + uint(h)) * wi + uint(w);
+    return typeI == DTYPE_F32
+        ? bufferI_f32[index]
+        : float(bufferI_f16[index]);
+}
+
+float16_t readInputH(int h, int w, uint c, uint hi, uint wi)
+{
+    if (uint(h) >= hi || uint(w) >= wi)
+        return float16_t(0.0);
+
+    uint index = (c * hi + uint(h)) * wi + uint(w);
+    return typeI == DTYPE_F32
+        ? float16_t(bufferI_f32[index])
+        : bufferI_f16[index];
+}
+
+void readTile(
+    int originH,
+    int originW,
+    uint c,
+    uint hi,
+    uint wi,
+    out float tile[WINOGRAD_SIZE][WINOGRAD_SIZE])
+{
+    [[unroll]]
+    for (uint row = 0u; row < WINOGRAD_SIZE; ++row)
+    {
+        [[unroll]]
+        for (uint col = 0u; col < WINOGRAD_SIZE; ++col)
+        {
+            tile[row][col] = readInputF(
+                originH + int(row), originW + int(col), c, hi, wi);
+        }
+    }
+}
+
+void readTile(
+    int originH,
+    int originW,
+    uint c,
+    uint hi,
+    uint wi,
+    out float16_t tile[WINOGRAD_SIZE][WINOGRAD_SIZE])
+{
+    [[unroll]]
+    for (uint row = 0u; row < WINOGRAD_SIZE; ++row)
+    {
+        [[unroll]]
+        for (uint col = 0u; col < WINOGRAD_SIZE; ++col)
+        {
+            tile[row][col] = readInputH(
+                originH + int(row), originW + int(col), c, hi, wi);
+        }
+    }
+}
+
+void transformRow(float d0, float d1, float d2, float d3, float d4, float d5,
+                  out float t0, out float t1, out float t2,
+                  out float t3, out float t4, out float t5)
+{
+    t0 = 4.0 * d0 - 5.0 * d2 + d4;
+    t1 = -4.0 * d1 - 4.0 * d2 + d3 + d4;
+    t2 = 4.0 * d1 - 4.0 * d2 - d3 + d4;
+    t3 = -2.0 * d1 - d2 + 2.0 * d3 + d4;
+    t4 = 2.0 * d1 - d2 - 2.0 * d3 + d4;
+    t5 = 4.0 * d1 - 5.0 * d3 + d5;
+}
+
+void transformRow(float16_t d0, float16_t d1, float16_t d2,
+                  float16_t d3, float16_t d4, float16_t d5,
+                  out float16_t t0, out float16_t t1, out float16_t t2,
+                  out float16_t t3, out float16_t t4, out float16_t t5)
+{
+    t0 = H4 * d0 - H5 * d2 + d4;
+    t1 = -H4 * d1 - H4 * d2 + d3 + d4;
+    t2 = H4 * d1 - H4 * d2 - d3 + d4;
+    t3 = -H2 * d1 - d2 + H2 * d3 + d4;
+    t4 = H2 * d1 - d2 - H2 * d3 + d4;
+    t5 = H4 * d1 - H5 * d3 + d5;
+}
+
+void transformTile(
+    in float inputTile[WINOGRAD_SIZE][WINOGRAD_SIZE],
+    out float transformed[WINOGRAD_SIZE][WINOGRAD_SIZE])
+{
+    [[unroll]]
+    for (uint col = 0u; col < WINOGRAD_SIZE; ++col)
+    {
+        transformRow(
+            inputTile[0][col], inputTile[1][col], inputTile[2][col],
+            inputTile[3][col], inputTile[4][col], inputTile[5][col],
+            transformed[0][col], transformed[1][col], transformed[2][col],
+            transformed[3][col], transformed[4][col], transformed[5][col]);
+    }
+}
+
+void transformTile(
+    in float16_t inputTile[WINOGRAD_SIZE][WINOGRAD_SIZE],
+    out float16_t transformed[WINOGRAD_SIZE][WINOGRAD_SIZE])
+{
+    [[unroll]]
+    for (uint col = 0u; col < WINOGRAD_SIZE; ++col)
+    {
+        transformRow(
+            inputTile[0][col], inputTile[1][col], inputTile[2][col],
+            inputTile[3][col], inputTile[4][col], inputTile[5][col],
+            transformed[0][col], transformed[1][col], transformed[2][col],
+            transformed[3][col], transformed[4][col], transformed[5][col]);
+    }
+}
+
+void writeCol(uint rowBase, float t0, float t1, float t2,
+              float t3, float t4, float t5,
+              uint ci, uint numTiles, uint c, uint tileIdx)
+{
+    writeTransformed(rowBase + 0u, ci, numTiles, c, tileIdx,
+                     4.0 * t0 - 5.0 * t2 + t4);
+    writeTransformed(rowBase + 1u, ci, numTiles, c, tileIdx,
+                     -4.0 * t1 - 4.0 * t2 + t3 + t4);
+    writeTransformed(rowBase + 2u, ci, numTiles, c, tileIdx,
+                     4.0 * t1 - 4.0 * t2 - t3 + t4);
+    writeTransformed(rowBase + 3u, ci, numTiles, c, tileIdx,
+                     -2.0 * t1 - t2 + 2.0 * t3 + t4);
+    writeTransformed(rowBase + 4u, ci, numTiles, c, tileIdx,
+                     2.0 * t1 - t2 - 2.0 * t3 + t4);
+    writeTransformed(rowBase + 5u, ci, numTiles, c, tileIdx,
+                     4.0 * t1 - 5.0 * t3 + t5);
+}
+
+void writeCol(uint rowBase, float16_t t0, float16_t t1, float16_t t2,
+              float16_t t3, float16_t t4, float16_t t5,
+              uint ci, uint numTiles, uint c, uint tileIdx)
+{
+    writeTransformed(rowBase + 0u, ci, numTiles, c, tileIdx,
+                     H4 * t0 - H5 * t2 + t4);
+    writeTransformed(rowBase + 1u, ci, numTiles, c, tileIdx,
+                     -H4 * t1 - H4 * t2 + t3 + t4);
+    writeTransformed(rowBase + 2u, ci, numTiles, c, tileIdx,
+                     H4 * t1 - H4 * t2 - t3 + t4);
+    writeTransformed(rowBase + 3u, ci, numTiles, c, tileIdx,
+                     -H2 * t1 - t2 + H2 * t3 + t4);
+    writeTransformed(rowBase + 4u, ci, numTiles, c, tileIdx,
+                     H2 * t1 - t2 - H2 * t3 + t4);
+    writeTransformed(rowBase + 5u, ci, numTiles, c, tileIdx,
+                     H4 * t1 - H5 * t3 + t5);
+}
+
+void writeTile(
+    in float transformed[WINOGRAD_SIZE][WINOGRAD_SIZE],
+    uint ci,
+    uint numTiles,
+    uint c,
+    uint tileIdx)
+{
+    [[unroll]]
+    for (uint row = 0u; row < WINOGRAD_SIZE; ++row)
+    {
+        writeCol(
+            row * WINOGRAD_SIZE,
+            transformed[row][0], transformed[row][1], transformed[row][2],
+            transformed[row][3], transformed[row][4], transformed[row][5],
+            ci, numTiles, c, tileIdx);
+    }
+}
+
+void writeTile(
+    in float16_t transformed[WINOGRAD_SIZE][WINOGRAD_SIZE],
+    uint ci,
+    uint numTiles,
+    uint c,
+    uint tileIdx)
+{
+    [[unroll]]
+    for (uint row = 0u; row < WINOGRAD_SIZE; ++row)
+    {
+        writeCol(
+            row * WINOGRAD_SIZE,
+            transformed[row][0], transformed[row][1], transformed[row][2],
+            transformed[row][3], transformed[row][4], transformed[row][5],
+            ci, numTiles, c, tileIdx);
+    }
+}
+
+void main()
+{
+    const uint numTilesW = pc.wi / 4u + (pc.wi % 4u != 0u ? 1u : 0u);
+    const uint numTilesH = pc.hi / 4u + (pc.hi % 4u != 0u ? 1u : 0u);
+    const uint numTiles = numTilesW * numTilesH;
+
+    const uint storageTiles = tileMajor
+        ? (numTiles / 16u + (numTiles % 16u != 0u ? 1u : 0u)) * 16u
+        : numTiles;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.ci * storageTiles)
+        return;
+
+    uint c = idx / storageTiles;
+    uint tileIdx = idx % storageTiles;
+    if (tileIdx >= numTiles)
+    {
+        [[unroll]]
+        for (uint transform = 0u; transform < 36u; ++transform)
+        {
+            if (typeW == DTYPE_F32)
+                writeTransformed(
+                    transform, pc.ci, numTiles, c, tileIdx, 0.0);
+            else
+                writeTransformed(
+                    transform, pc.ci, numTiles, c, tileIdx,
+                    float16_t(0.0));
+        }
+        return;
+    }
+    uint tileH = tileIdx / numTilesW;
+    uint tileW = tileIdx % numTilesW;
+
+    int originH = int(tileH * 4u) - 1;
+    int originW = int(tileW * 4u) - 1;
+
+    if (typeW == DTYPE_F32)
+    {
+        float inputTile[WINOGRAD_SIZE][WINOGRAD_SIZE];
+        float transformed[WINOGRAD_SIZE][WINOGRAD_SIZE];
+
+        readTile(originH, originW, c, pc.hi, pc.wi, inputTile);
+        transformTile(inputTile, transformed);
+        writeTile(transformed, pc.ci, numTiles, c, tileIdx);
+    }
+    else
+    {
+        float16_t inputTile[WINOGRAD_SIZE][WINOGRAD_SIZE];
+        float16_t transformed[WINOGRAD_SIZE][WINOGRAD_SIZE];
+
+        readTile(originH, originW, c, pc.hi, pc.wi, inputTile);
+        transformTile(inputTile, transformed);
+        writeTile(transformed, pc.ci, numTiles, c, tileIdx);
+    }
+}

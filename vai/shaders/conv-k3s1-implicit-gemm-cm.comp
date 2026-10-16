@@ -1,0 +1,654 @@
+/*=============================================================================
+ FP16 implicit GEMM for K=3/S=1.
+ Bindings: O=0, I=1, W=2, BIAS=3, SCALE=4, RESIDUAL=5.
+ Dispatch: x=N tiles, y=M tiles.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint wgSize = 128u;
+layout(constant_id = 1) const uint wgM = 128u;
+layout(constant_id = 2) const uint wgN = 32u;
+layout(constant_id = 3) const uint sgM = 32u;
+layout(constant_id = 4) const uint sgN = 32u;
+layout(constant_id = 5) const bool rowAlignedFlatSpatial = false;
+layout(constant_id = 6) const bool shortcut = false;
+layout(constant_id = 7) const bool flatSpatial = false;
+layout(constant_id = 8) const uint panelK = 64u;
+layout(constant_id = 9) const bool directOutput = false;
+layout(constant_id = SPEC_ID_TYPE_CI) const uint CI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_CO) const uint CO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HI) const uint HI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HO) const uint HO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WI) const uint WI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WO) const uint WO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F32 { vec4 bufferI_4f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F16 { f16vec4 bufferI_4f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_4F16 { f16vec4 bufferW_4f16[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_F32 { float bufferRes_f32[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_F16 { float16_t bufferRes_f16[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_4F32 { vec4 bufferRes_4f32[]; };
+layout(set = 0, binding = 5) restrict readonly buffer RES_BUF_4F16 { f16vec4 bufferRes_4f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint tM = 16u;
+const uint tN = 16u;
+const uint tK = 16u;
+const uint sgSize = 32u;
+const uint sgCount = wgSize / sgSize;
+const uint sgMCount = wgM / sgM;
+const uint sgNCount = wgN / sgN;
+const uint sgpMIter = sgM / tM;
+const uint sgpNIter = sgN / tN;
+const uint accFrags = sgpMIter * sgpNIter;
+const uint CM_TILE_ELEMS = tM * tN;
+const uint spatialTileW = wgN;
+
+shared f16vec4 BsPacked[panelK * (wgN >> 2u)];
+shared float Cs[directOutput ? 1u : sgCount * CM_TILE_ELEMS];
+shared vec2 affineParams[directOutput ? 1u : sgCount * tM];
+
+#define matA     coopmat<float16_t, gl_ScopeSubgroup, tM, tK, gl_MatrixUseA>
+#define matB     coopmat<float16_t, gl_ScopeSubgroup, tK, tN, gl_MatrixUseB>
+#define accMat32 coopmat<float, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+
+float16_t readI(uint index)
+{
+    return typeI == DTYPE_F32
+        ? float16_t(bufferI_f32[index])
+        : bufferI_f16[index];
+}
+
+f16vec4 readI4(uint index)
+{
+    return typeI == DTYPE_F32
+        ? f16vec4(bufferI_4f32[index >> 2u])
+        : bufferI_4f16[index >> 2u];
+}
+
+float readBias(uint channel)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[channel] : float(bufferBias_f16[channel]);
+}
+float readScale(uint channel) { return typeP == DTYPE_F32 ? bufferScale_f32[channel] : float(bufferScale_f16[channel]); }
+
+vec4 readResidual4(uint base)
+{
+    if (typeI == DTYPE_F32)
+        return (base & 3u) == 0u
+            ? bufferRes_4f32[base >> 2u]
+            : vec4(bufferRes_f32[base], bufferRes_f32[base + 1u],
+                   bufferRes_f32[base + 2u], bufferRes_f32[base + 3u]);
+    return (base & 3u) == 0u
+        ? vec4(bufferRes_4f16[base >> 2u])
+        : vec4(bufferRes_f16[base], bufferRes_f16[base + 1u],
+               bufferRes_f16[base + 2u], bufferRes_f16[base + 3u]);
+}
+
+float applyOutput(
+    uint offset,
+    float value,
+    float scale,
+    float bias)
+{
+    value = hasScale == 0u
+        ? value + bias
+        : fma(value, scale, bias);
+    value = applyEpilogue(value);
+    if (shortcut)
+        value += typeI == DTYPE_F32
+            ? bufferRes_f32[offset]
+            : float(bufferRes_f16[offset]);
+    return value;
+}
+
+vec4 applyOutput4(
+    uint offset,
+    vec4 value,
+    float scale,
+    float bias)
+{
+    value = hasScale == 0u
+        ? value + vec4(bias)
+        : fma(value, vec4(scale), vec4(bias));
+    value = applyEpilogue(value);
+    if (shortcut)
+        value += readResidual4(offset);
+    return value;
+}
+
+void writeO(uint index, float value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_f32[index] = value;
+    else
+        bufferO_f16[index] = float16_t(value);
+}
+
+void writeO4(uint index, vec4 value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_4f32[index] = value;
+    else
+        bufferO_4f16[index] = f16vec4(value);
+}
+
+void writeOutput4(
+    uint channel,
+    uint n,
+    uint N,
+    uint validColumns,
+    vec4 value,
+    float scale,
+    float bias)
+{
+    if (validColumns == 0u)
+        return;
+
+    uint base = channel * N + n;
+    if (WO_SPEC != 0u && (WO_SPEC & 3u) == 0u)
+    {
+        if (validColumns >= 4u)
+            writeO4(base >> 2u, applyOutput4(base, value, scale, bias));
+        return;
+    }
+
+    if (validColumns >= 4u && (base & 3u) == 0u)
+    {
+        writeO4(base >> 2u, applyOutput4(base, value, scale, bias));
+        return;
+    }
+
+    if (validColumns >= 1u)
+        writeO(base, applyOutput(base, value.x, scale, bias));
+    if (validColumns >= 2u)
+        writeO(base + 1u, applyOutput(base + 1u, value.y, scale, bias));
+    if (validColumns >= 3u)
+        writeO(base + 2u, applyOutput(base + 2u, value.z, scale, bias));
+    if (validColumns >= 4u)
+        writeO(base + 3u, applyOutput(base + 3u, value.w, scale, bias));
+}
+
+void writeOutputTile(
+    accMat32 acc,
+    uint m0,
+    uint localN0,
+    uint tileRow0,
+    uint tileW0,
+    uint tileN0,
+    uint tileValidRows,
+    uint tileValidColumns,
+    uint Wo,
+    uint N,
+    bool reuseSharedTile)
+{
+    uint lane = gl_SubgroupInvocationID;
+    uint tileBase = gl_SubgroupID * CM_TILE_ELEMS;
+    uint affineBase = gl_SubgroupID * tM;
+    coopMatStore(acc, Cs, tileBase, tN, gl_CooperativeMatrixLayoutRowMajor);
+    if (lane < tM)
+    {
+        const uint channel = m0 + lane;
+        affineParams[affineBase + lane] =
+            vec2(hasScale == 0u ? 1.0 : readScale(channel), readBias(channel));
+    }
+    controlBarrier(
+        gl_ScopeSubgroup,
+        gl_ScopeSubgroup,
+        gl_StorageSemanticsShared,
+        gl_SemanticsAcquireRelease);
+
+    const uint vecsPerRow = tN >> 2u;
+    for (uint vectorIndex = lane;
+         vectorIndex < CM_TILE_ELEMS / 4u;
+         vectorIndex += gl_SubgroupSize)
+    {
+        uint row = vectorIndex / vecsPerRow;
+        uint col = (vectorIndex % vecsPerRow) * 4u;
+        uint sharedBase = tileBase + row * tN + col;
+        const vec4 value = vec4(
+            Cs[sharedBase], Cs[sharedBase + 1u],
+            Cs[sharedBase + 2u], Cs[sharedBase + 3u]);
+        const uint localN = localN0 + col;
+        const uint localRow = localN / spatialTileW;
+        const uint localColumn = localN % spatialTileW;
+        const uint valid = flatSpatial
+            ? localN < tileValidColumns
+                ? min(4u, tileValidColumns - localN)
+                : 0u
+            : localRow < tileValidRows &&
+              localColumn < tileValidColumns
+                ? min(4u, tileValidColumns - localColumn)
+                : 0u;
+        const uint globalN = flatSpatial
+            ? tileN0 + localN
+            : (tileRow0 + localRow) * Wo + tileW0 + localColumn;
+        const vec2 affineParam = affineParams[affineBase + row];
+        writeOutput4(
+            m0 + row, globalN, N, valid, value,
+            affineParam.x, affineParam.y);
+    }
+
+    if (reuseSharedTile)
+    {
+        controlBarrier(
+            gl_ScopeSubgroup,
+            gl_ScopeSubgroup,
+            gl_StorageSemanticsShared,
+            gl_SemanticsAcquireRelease);
+    }
+}
+
+void writeOutputTileDirect(
+    inout accMat32 acc,
+    uint m0,
+    uint n0,
+    uint N)
+{
+    accMat32 biasValues;
+    if (hasBias == 0u)
+        biasValues = accMat32(0.0);
+    else if (typeP == DTYPE_F32)
+        coopMatLoad(
+            biasValues, bufferBias_f32, m0, 0u,
+            gl_CooperativeMatrixLayoutColumnMajor);
+    else
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, tM, tN,
+                gl_MatrixUseAccumulator> biasValuesF16;
+        coopMatLoad(
+            biasValuesF16, bufferBias_f16, m0, 0u,
+            gl_CooperativeMatrixLayoutColumnMajor);
+        biasValues = accMat32(biasValuesF16);
+    }
+
+    accMat32 scaleValues;
+    if (hasScale != 0u)
+    {
+        if (typeP == DTYPE_F32)
+            coopMatLoad(
+                scaleValues, bufferScale_f32, m0, 0u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        else
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, tM, tN,
+                    gl_MatrixUseAccumulator> scaleValuesF16;
+            coopMatLoad(
+                scaleValuesF16, bufferScale_f16, m0, 0u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+            scaleValues = accMat32(scaleValuesF16);
+        }
+    }
+
+    [[unroll]]
+    for (int element = 0; element < acc.length(); ++element)
+    {
+        const float value = hasScale == 0u
+            ? acc[element] + biasValues[element]
+            : fma(acc[element], scaleValues[element], biasValues[element]);
+        acc[element] = applyEpilogue(value);
+    }
+
+    const uint outputBase = m0 * N + n0;
+    if (shortcut)
+    {
+        accMat32 residualValues;
+        if (typeI == DTYPE_F32)
+            coopMatLoad(
+                residualValues, bufferRes_f32, outputBase, N,
+                gl_CooperativeMatrixLayoutRowMajor);
+        else
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, tM, tN,
+                    gl_MatrixUseAccumulator> residualValuesF16;
+            coopMatLoad(
+                residualValuesF16, bufferRes_f16, outputBase, N,
+                gl_CooperativeMatrixLayoutRowMajor);
+            residualValues = accMat32(residualValuesF16);
+        }
+        [[unroll]]
+        for (int element = 0; element < acc.length(); ++element)
+            acc[element] += residualValues[element];
+    }
+
+    if (typeO == DTYPE_F32)
+        coopMatStore(
+            acc, bufferO_f32, outputBase, N,
+            gl_CooperativeMatrixLayoutRowMajor);
+    else
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, tM, tN,
+                gl_MatrixUseAccumulator> outputValues =
+            coopmat<float16_t, gl_ScopeSubgroup, tM, tN,
+                    gl_MatrixUseAccumulator>(acc);
+        coopMatStore(
+            outputValues, bufferO_f16, outputBase, N,
+            gl_CooperativeMatrixLayoutRowMajor);
+    }
+}
+
+uint transformedWeightIndex(uint m, uint k, uint kTiles)
+{
+    uint mTile = m / tM;
+    uint kTile = k / tK;
+    uint row = m % tM;
+    uint column = k % tK;
+    return (mTile * kTiles + kTile) * (tM * tK) +
+           row * tK + column;
+}
+
+void main()
+{
+    const uint Hi = HI_SPEC != 0u ? HI_SPEC : pc.hi;
+    const uint Wi = WI_SPEC != 0u ? WI_SPEC : pc.wi;
+    const uint Ho = HO_SPEC != 0u ? HO_SPEC : pc.ho;
+    const uint Wo = WO_SPEC != 0u ? WO_SPEC : pc.wo;
+    const uint Ci = CI_SPEC != 0u ? CI_SPEC : pc.ci;
+    const uint Co = CO_SPEC != 0u ? CO_SPEC : pc.co;
+    const uint N = Ho * Wo;
+    const uint KK = Ci * 9u;
+    const uint kTiles = KK / tK;
+
+    uint tileColumn = gl_WorkGroupID.x;
+    uint tilesPerRow = Wo / spatialTileW + (Wo % spatialTileW != 0u ? 1u : 0u);
+    uint tileN0 = tileColumn * spatialTileW;
+    uint tileRow = flatSpatial
+        ? tileN0 / Wo
+        : tileColumn / tilesPerRow;
+    uint tileW0 = flatSpatial
+        ? tileN0 % Wo
+        : (tileColumn % tilesPerRow) * spatialTileW;
+    uint tileValidRows = 1u;
+    uint tileValidColumns = flatSpatial
+        ? min(spatialTileW, N - tileN0)
+        : min(spatialTileW, Wo - tileW0);
+    uint rawM = gl_WorkGroupID.y * wgM;
+    uint subgroup = gl_SubgroupID;
+    uint subgroupIdM = subgroup / sgNCount;
+    uint subgroupIdN = subgroup % sgNCount;
+    uint m0 = rawM + subgroupIdM * sgM;
+    uint bTileBase = subgroupIdN * sgpNIter;
+
+    // sgM/sgN select up to a 4x4 set of standard 16x16 cooperative-matrix
+    // accumulators. Results are always exported through coopMatStore below.
+    matA a[4];
+    matB b[4];
+    accMat32 acc32[16];
+    [[unroll]]
+    for (uint index = 0u; index < 16u; ++index)
+        if (index < accFrags)
+            acc32[index] = accMat32(0.0);
+
+    {
+        for (uint panelBase = 0u; panelBase < KK; panelBase += panelK)
+        {
+            const uint panelChannels = panelK / 9u;
+            const uint packedBlockColumns = 8u;
+            const uint packedBlocks =
+                spatialTileW / packedBlockColumns;
+            const uint packedInputLoads =
+                panelChannels * 3u * packedBlocks;
+            const uint iters = packedInputLoads / gl_WorkGroupSize.x +
+                (packedInputLoads % gl_WorkGroupSize.x != 0u ? 1u : 0u);
+            const bool channelMajorPackedLoad =
+                rowAlignedFlatSpatial && packedBlocks == 2u &&
+                wgSize == 2u * panelChannels &&
+                packedInputLoads == 3u * wgSize;
+
+            [[unroll]]
+            for (uint iter = 0u; iter < iters; ++iter)
+            {
+                const uint fill = gl_LocalInvocationID.x +
+                    iter * gl_WorkGroupSize.x;
+                if (fill < packedInputLoads)
+                {
+                    const uint channelStride = 3u * packedBlocks;
+                    const uint localChannel = channelMajorPackedLoad
+                        ? gl_LocalInvocationID.x % panelChannels
+                        : fill / channelStride;
+                    const uint rowSpatial = channelMajorPackedLoad
+                        ? 0u
+                        : fill % channelStride;
+                    const uint kh = channelMajorPackedLoad
+                        ? iter
+                        : rowSpatial / packedBlocks;
+                    const uint block = channelMajorPackedLoad
+                        ? gl_LocalInvocationID.x / panelChannels
+                        : rowSpatial % packedBlocks;
+                    const uint blockColumn =
+                        block * packedBlockColumns;
+                    const uint channel =
+                        panelBase / 9u + localChannel;
+                    const uint blockN = flatSpatial
+                        ? tileN0 + blockColumn
+                        : tileRow * Wo + tileW0 + blockColumn;
+                    const uint blockRow = rowAlignedFlatSpatial
+                        ? tileRow
+                        : flatSpatial
+                            ? blockN / Wo
+                            : tileRow;
+                    const int hIn = int(blockRow) + (int(kh) - 1);
+                    const bool validRow =
+                        (rowAlignedFlatSpatial ||
+                         !flatSpatial || blockN < N) &&
+                        uint(hIn) < Hi;
+
+                    f16vec4 center0 = f16vec4(0.0);
+                    f16vec4 center1 = f16vec4(0.0);
+                    float16_t left = float16_t(0.0);
+                    float16_t right = float16_t(0.0);
+                    const uint centerW = rowAlignedFlatSpatial
+                        ? tileW0 + blockColumn
+                        : flatSpatial
+                            ? blockN % Wo
+                            : tileW0 + blockColumn;
+                    const uint rowBase = validRow
+                        ? (channel * Hi + uint(hIn)) * Wi
+                        : 0u;
+                    const uint centerBase = rowBase + centerW;
+
+                    if (rowAlignedFlatSpatial &&
+                        WI_SPEC != 0u && WI_SPEC == WO_SPEC)
+                    {
+                        if (validRow)
+                        {
+                            center0 = readI4(centerBase);
+                            center1 = readI4(centerBase + 4u);
+                        }
+                    }
+                    else if (WI_SPEC != 0u && (WI_SPEC & 7u) == 0u)
+                    {
+                        if (validRow && centerW < Wi)
+                        {
+                            center0 = readI4(centerBase);
+                            center1 = readI4(centerBase + 4u);
+                        }
+                    }
+                    else if (validRow && centerW + 7u < Wi &&
+                             (centerBase & 3u) == 0u)
+                    {
+                        center0 = readI4(centerBase);
+                        center1 = readI4(centerBase + 4u);
+                    }
+                    else if (validRow)
+                    {
+                        [[unroll]]
+                        for (uint component = 0u;
+                             component < 4u; ++component)
+                        {
+                            if (centerW + component < Wi)
+                                center0[component] =
+                                    readI(rowBase + centerW + component);
+                            if (centerW + 4u + component < Wi)
+                                center1[component] =
+                                    readI(
+                                        rowBase + centerW + 4u +
+                                        component);
+                        }
+                    }
+
+                    if (validRow && centerW > 0u)
+                        left = readI(rowBase + centerW - 1u);
+                    if (validRow && centerW + 8u < Wi)
+                        right = readI(rowBase + centerW + 8u);
+
+                    const uint kBase =
+                        (localChannel * 9u + kh * 3u) * wgN +
+                        blockColumn;
+                    const uint leftBase4 = kBase >> 2u;
+                    const uint centerBase4 =
+                        (kBase + wgN) >> 2u;
+                    const uint rightBase4 =
+                        (kBase + 2u * wgN) >> 2u;
+                    BsPacked[leftBase4] =
+                        f16vec4(
+                            left, center0.x, center0.y, center0.z);
+                    BsPacked[leftBase4 + 1u] =
+                        f16vec4(
+                            center0.w, center1.x,
+                            center1.y, center1.z);
+                    BsPacked[centerBase4] = center0;
+                    BsPacked[centerBase4 + 1u] = center1;
+                    BsPacked[rightBase4] =
+                        f16vec4(
+                            center0.y, center0.z,
+                            center0.w, center1.x);
+                    BsPacked[rightBase4 + 1u] =
+                        f16vec4(
+                            center1.y, center1.z,
+                            center1.w, right);
+                }
+            }
+            barrier();
+
+            for (uint kOffset = 0u;
+                 kOffset < panelK; kOffset += tK)
+            {
+                [[unroll]]
+                for (uint nTile = 0u; nTile < 4u; ++nTile)
+                {
+                    if (nTile < sgpNIter)
+                    {
+                        const uint bBase =
+                            kOffset * wgN +
+                            (bTileBase + nTile) * tN;
+                        coopMatLoad(
+                            b[nTile], BsPacked,
+                            bBase >> 2u,
+                            wgN >> 2u,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                }
+
+                [[unroll]]
+                for (uint mTile = 0u; mTile < 4u; ++mTile)
+                {
+                    if (mTile < sgpMIter)
+                    {
+                        const uint m = m0 + mTile * tM;
+                        const uint k = panelBase + kOffset;
+                        coopMatLoad(
+                            a[mTile], bufferW_4f16,
+                            transformedWeightIndex(
+                                m, k, kTiles) >> 2u,
+                            tK >> 2u,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                        [[unroll]]
+                        for (uint nTile = 0u;
+                             nTile < 4u; ++nTile)
+                        {
+                            if (nTile < sgpNIter)
+                            {
+                                const uint accIndex =
+                                    mTile * sgpNIter + nTile;
+                                acc32[accIndex] = coopMatMulAdd(
+                                    a[mTile], b[nTile],
+                                    acc32[accIndex]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (panelBase + panelK < KK)
+                barrier();
+        }
+    }
+
+    [[unroll]]
+    for (uint mTile = 0u; mTile < 4u; ++mTile)
+    {
+        if (mTile < sgpMIter)
+        {
+            [[unroll]]
+            for (uint nTile = 0u; nTile < 4u; ++nTile)
+            {
+                if (nTile < sgpNIter)
+                {
+                    uint accIndex = mTile * sgpNIter + nTile;
+                    uint fragmentColumn =
+                        (bTileBase + nTile) * tN;
+                    if (directOutput)
+                        writeOutputTileDirect(
+                            acc32[accIndex],
+                            m0 + mTile * tM,
+                            tileN0 + fragmentColumn,
+                            N);
+                    else
+                        writeOutputTile(
+                            acc32[accIndex],
+                            m0 + mTile * tM,
+                            fragmentColumn,
+                            tileRow,
+                            tileW0,
+                            tileN0,
+                            tileValidRows,
+                            tileValidColumns,
+                            Wo,
+                            N,
+                            accIndex + 1u < accFrags);
+                }
+            }
+        }
+    }
+}

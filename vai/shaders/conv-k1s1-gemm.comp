@@ -1,0 +1,326 @@
+/*=============================================================================
+ Unified guarded/aligned direct/K-split 1x1 GEMM family.
+ Bindings: O=0, I=1, W=2, BIAS=3, SCALE=4.
+ Dispatch: x=pc.n tiles, y=pc.co tiles, z=split count.
+ Push constants: PushConstants.
+ AFFINE:
+   0: O = activation(W * I + bias)
+   1: O = activation(scale * (W * I) + bias)
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 1) const uint wgM = 64u;
+layout(constant_id = 2) const uint wgN = 64u;
+layout(constant_id = 3) const uint wgK = 8u;
+layout(constant_id = 4) const uint tM = 4u;
+layout(constant_id = 5) const bool alignM = false;
+layout(constant_id = 6) const bool alignN = false;
+layout(constant_id = 7) const bool alignK = false;
+layout(constant_id = 8) const uint splitK = 0u;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F32 { vec4 bufferI_4f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F16 { f16vec4 bufferI_4f16[]; };
+
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F32 { float bufferW_f32[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint tN = 4u;
+const uint PAD_A = 4u;
+const uint A_STRIDE = wgM + PAD_A;
+const uint B4_COLS = wgN / tN;
+const bool FULL_TILE = alignM && alignN && alignK;
+
+shared float As[2][wgK * A_STRIDE];
+shared float Bs[2][wgK * wgN];
+
+float readI(uint i) { return typeI == DTYPE_F32 ? bufferI_f32[i] : float(bufferI_f16[i]); }
+vec4 readI4(uint i) { return typeI == DTYPE_F32 ? bufferI_4f32[i] : vec4(bufferI_4f16[i]); }
+float readW(uint i) { return typeW == DTYPE_F32 ? bufferW_f32[i] : float(bufferW_f16[i]); }
+
+void writeO(uint i, float v)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_f32[i] = v;
+    else
+        bufferO_f16[i] = float16_t(v);
+}
+
+void writeB4(uint tile, uint k, uint n4, vec4 v)
+{
+    uint base = k * wgN + n4 * tN;
+    Bs[tile][base] = v.x;
+    Bs[tile][base + 1u] = v.y;
+    Bs[tile][base + 2u] = v.z;
+    Bs[tile][base + 3u] = v.w;
+}
+
+void writePartial4(uint partialBase, uint m, uint n0, vec4 v)
+{
+    uint base = partialBase + m * pc.n + n0;
+    if (alignN)
+    {
+        bufferO_4f32[base >> 2u] = v;
+        return;
+    }
+    if (n0 >= pc.n)
+        return;
+    uint remaining = pc.n - n0;
+    bufferO_f32[base] = v.x;
+    if (remaining > 1u) bufferO_f32[base + 1u] = v.y;
+    if (remaining > 2u) bufferO_f32[base + 2u] = v.z;
+    if (remaining > 3u) bufferO_f32[base + 3u] = v.w;
+}
+
+vec4 applyOutput(uint i, vec4 acc)
+{
+    vec4 value = hasScale == 0u
+        ? acc + vec4(typeW == DTYPE_F32
+              ? (hasBias != 0u ? bufferBias_f32[i] : 0.0)
+              : (hasBias != 0u ? float(bufferBias_f16[i]) : 0.0))
+        : fma(vec4(typeP == DTYPE_F32
+                  ? bufferScale_f32[i]
+                  : float(bufferScale_f16[i])),
+              acc,
+              vec4(typeP == DTYPE_F32
+                  ? (hasBias != 0u ? bufferBias_f32[i] : 0.0)
+                  : (hasBias != 0u ? float(bufferBias_f16[i]) : 0.0)));
+    return applyEpilogue(value);
+}
+
+void writeO4(uint m, uint n0, vec4 acc)
+{
+    if ((!alignM && m >= pc.co) || (!alignN && n0 >= pc.n))
+        return;
+
+    uint base = m * pc.n + n0;
+    vec4 v = applyOutput(m, acc);
+    if (alignN)
+    {
+        if (typeO == DTYPE_F32)
+            bufferO_4f32[base >> 2u] = v;
+        else
+            bufferO_4f16[base >> 2u] = f16vec4(v);
+        return;
+    }
+
+    uint remaining = pc.n - n0;
+    writeO(base, v.x);
+    if (remaining > 1u) writeO(base + 1u, v.y);
+    if (remaining > 2u) writeO(base + 2u, v.z);
+    if (remaining > 3u) writeO(base + 3u, v.w);
+}
+
+void main()
+{
+    uint tileCol = gl_WorkGroupID.x;
+    uint tileRow = gl_WorkGroupID.y;
+    uint splitId = splitK != 0u ? gl_WorkGroupID.z : 0u;
+    uint t = gl_LocalInvocationID.x;
+    uint T = gl_WorkGroupSize.x;
+
+    uint threadN = t % (wgN / tN);
+    uint threadM = t / (wgN / tN);
+    uint innerColA = t % wgK;
+    uint innerRowA = t / wgK;
+    uint rowStrideA = T / wgK;
+    uint innerColB = t % wgN;
+    uint innerRowB = t / wgN;
+    uint rowStrideB = T / wgN;
+    uint innerColB4 = t % B4_COLS;
+    uint innerRowB4 = t / B4_COLS;
+    uint rowStrideB4 = T / B4_COLS;
+    uint m0base = tileRow * wgM + innerRowA;
+    uint n0base = tileCol * wgN + innerColB;
+    uint n0base4 = tileCol * wgN + innerColB4 * tN;
+    uint kStart = splitK != 0u
+        ? splitId * splitK
+        : 0u;
+    uint kRange = splitK != 0u
+        ? (kStart < pc.ci ? min(splitK, pc.ci - kStart) : 0u)
+        : pc.ci;
+    vec4 acc[8];
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+        if (tm < tM)
+            acc[tm] = vec4(0.0);
+
+    uint numKTiles = alignK
+        ? kRange / wgK
+        : kRange / wgK + (kRange % wgK != 0u ? 1u : 0u);
+    uint cur = 0u;
+
+    uint k = kStart + innerColA;
+    if (alignM && alignK)
+    {
+        uint wBase = m0base * pc.ci + k;
+        uint wStep = rowStrideA * pc.ci;
+        for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+        {
+            As[0][innerColA * A_STRIDE + innerRowA + bm] = readW(wBase);
+            wBase += wStep;
+        }
+
+    }
+    else
+    {
+        const bool validAColumn = innerColA < kRange;
+        k = validAColumn ? kStart + innerColA : 0u;
+        for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+        {
+            uint m = m0base + bm;
+            As[0][innerColA * A_STRIDE + innerRowA + bm] =
+                ((alignM || m < pc.co) && validAColumn) ? readW(m * pc.ci + k) : 0.0;
+        }
+    }
+    if (alignN && alignK)
+    {
+        for (uint bk = innerRowB4; bk < wgK; bk += rowStrideB4)
+        {
+            uint index = ((kStart + bk) * pc.n + n0base4) >> 2u;
+            writeB4(0u, bk, innerColB4, readI4(index));
+        }
+    }
+    else
+    {
+        for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+        {
+            uint kOffset = innerRowB + bk;
+            bool validBRow = kOffset < kRange;
+            uint k2 = validBRow ? kStart + kOffset : 0u;
+            Bs[0][(innerRowB + bk) * wgN + innerColB] =
+                (validBRow && (alignN || n0base < pc.n)) ? readI(k2 * pc.n + n0base) : 0.0;
+        }
+    }
+    barrier();
+
+    for (uint ki = 0u; ki < numKTiles; ++ki)
+    {
+        uint next = 1u - cur;
+        if (ki + 1u < numKTiles)
+        {
+            uint tileOffset = (ki + 1u) * wgK;
+            uint k0next = kStart + tileOffset;
+            k = k0next + innerColA;
+            if (alignM && alignK)
+            {
+                uint wBase = m0base * pc.ci + k;
+                uint wStep = rowStrideA * pc.ci;
+                for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+                {
+                    As[next][innerColA * A_STRIDE + innerRowA + bm] =
+                        readW(wBase);
+                    wBase += wStep;
+                }
+            }
+            else
+            {
+                const bool validAColumn = tileOffset + innerColA < kRange;
+                k = validAColumn ? kStart + tileOffset + innerColA : 0u;
+                for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+                {
+                    uint m = m0base + bm;
+                    As[next][innerColA * A_STRIDE + innerRowA + bm] =
+                        ((alignM || m < pc.co) && validAColumn) ? readW(m * pc.ci + k) : 0.0;
+                }
+            }
+            if (alignN && alignK)
+            {
+                for (uint bk = innerRowB4; bk < wgK; bk += rowStrideB4)
+                {
+                    uint index = ((k0next + bk) * pc.n + n0base4) >> 2u;
+                    writeB4(next, bk, innerColB4, readI4(index));
+                }
+            }
+            else
+            {
+                for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+                {
+                    uint kOffset = tileOffset + innerRowB + bk;
+                    bool validBRow = kOffset < kRange;
+                    uint k2 = validBRow ? kStart + kOffset : 0u;
+                    Bs[next][(innerRowB + bk) * wgN + innerColB] =
+                        (validBRow && (alignN || n0base < pc.n)) ? readI(k2 * pc.n + n0base) : 0.0;
+                }
+            }
+        }
+
+        for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+        {
+            uint aBase = dotIdx * A_STRIDE + threadM * tM;
+            uint bBase = dotIdx * wgN + threadN * tN;
+            vec4 rN = vec4(Bs[cur][bBase], Bs[cur][bBase + 1u],
+                           Bs[cur][bBase + 2u], Bs[cur][bBase + 3u]);
+            [[unroll]]
+            for (uint tm = 0u; tm < 8u; ++tm)
+                if (tm < tM)
+                    acc[tm] = fma(vec4(As[cur][aBase + tm]), rN, acc[tm]);
+        }
+
+        if (!FULL_TILE || ki + 1u < numKTiles)
+            barrier();
+        cur = next;
+    }
+
+    uint m0 = tileRow * wgM + threadM * tM;
+    uint n0 = tileCol * wgN + threadN * tN;
+    if (splitK != 0u)
+    {
+        uint partialBase = splitId * pc.co * pc.n;
+
+        [[unroll]]
+        for (uint tm = 0u; tm < 8u; ++tm)
+        {
+            if (tm < tM)
+            {
+                uint m = m0 + tm;
+                if (alignM || m < pc.co)
+                    writePartial4(partialBase, m, n0, acc[tm]);
+            }
+        }
+        return;
+    }
+
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+        if (tm < tM)
+            writeO4(m0 + tm, n0, acc[tm]);
+}

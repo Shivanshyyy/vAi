@@ -1,0 +1,178 @@
+/*=============================================================================
+ rms-norm.comp: RMS normalization over the feature axis
+     O[i, j] = I[i, j] * rsqrt(mean(I[i, :]^2) + eps) (* scale[j]) (+ shift[j])
+
+ A workgroup normalizes one row: its wgSize threads accumulate strided
+ partials of Σx², reduce them, then normalize + scale in parallel. RMS needs
+ no mean centering, so a plain 1-pass sum of squares is exact to the same
+ grade as a two-pass one — every term is non-negative, which is why the
+ cancellation that forces LayerNorm's shifted form (layer-norm.comp)
+ has no counterpart here.
+
+ - O (typeO), I (typeI), scale (typeW) are fp32 or fp16 via same-binding buffer
+   aliases; accumulation is always fp32. scale and shift share typeW.
+ - reduction: subgroupAdd two-level (sgReduce == 1, host pins the
+   subgroup size) or shared-memory tree fallback.
+ - aligned == 1 (typeO == typeI == fp32, F % 4 == 0): direct vec4 I/O loads.
+ - hasScale / hasShift == 0: that term drops out and its binding is never read.
+ - Dispatch (host): one workgroup per row, rows folded over grid x/y as
+   .dispatch(gridX, ceil(batchSize / gridX)) -- grid x alone caps at 65535
+   on some devices (Intel), below a long prefill's row count.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#include "common/spec_constants.h"
+
+layout(constant_id = 0) const uint wgSize   = 256;             // threads per workgroup (host rmsTuning())
+layout(constant_id = 1) const uint sgReduce = 0;               // 1: subgroupAdd reduction, 0: shared tree
+layout(constant_id = 2) const uint hasScale = 1;               // 0: no scale (scale 1)
+layout(constant_id = 3) const uint hasShift  = 0;               // 0: no shift (shift 0)
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;     // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;     // I (input) dtype
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0;     // scale (and shift) dtype
+layout(constant_id = SPEC_ID_ALIGNED) const uint aligned = 0;  // 1: vec4 I/O loads
+
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32   { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16   { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32  { vec4 bufferO_4f32[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32   { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16   { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F32  { vec4 bufferI_4f32[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 2) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 3) restrict readonly buffer SHIFT_BUF_F32  { float bufferShift_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer SHIFT_BUF_F16  { float16_t bufferShift_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint batchSize;
+    uint featSize;
+    float eps;
+    uint gridX;     // dispatch width -- row = y * gridX + x
+};
+
+float readI(uint i)     { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+float readScale(uint j)
+{
+    if (hasScale == 0u) return 1.0;
+    return (typeW == DTYPE_F32) ? bufferScale_f32[j] : float(bufferScale_f16[j]);
+}
+float readShift(uint j)
+{
+    if (hasShift == 0u) return 0.0;
+    return (typeW == DTYPE_F32) ? bufferShift_f32[j] : float(bufferShift_f16[j]);
+}
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+// Per-thread partial sums (spec-constant-sized) — with sgReduce == 1 only
+// the first gl_NumSubgroups (<= wgSize / sg) slots are used.
+shared float sSumSq[wgSize];
+
+// Final reduced statistic, broadcast to all threads in the workgroup
+shared float gInvRms;
+
+// Phase 1: per-thread sum of squares over a strided slice (adjacent lanes read
+// adjacent elements -> coalesced). Returns Σx² of this thread's elements.
+float accumAligned(uint base, uint F)
+{
+    // vec4 loads — typeI == fp32 && F % 4 == 0 (host-guaranteed)
+    uint F4    = F / 4u;
+    uint base4 = base / 4u;
+    vec4 q4 = vec4(0.0);
+    for (uint j = gl_LocalInvocationID.x; j < F4; j += wgSize)
+    {
+        vec4 x = bufferI_4f32[base4 + j];
+        q4 += x * x;
+    }
+    return q4.x + q4.y + q4.z + q4.w;
+}
+
+float accumScalar(uint base, uint F)
+{
+    float sumSq = 0.0;
+    for (uint j = gl_LocalInvocationID.x; j < F; j += wgSize)
+    {
+        float x = readI(base + j);
+        sumSq += x * x;
+    }
+    return sumSq;
+}
+
+// Phase 3: normalize + scale (+ shift) over the same strided slice
+void normalizeAligned(uint base, uint F, float invRms)
+{
+    uint F4    = F / 4u;
+    uint base4 = base / 4u;
+    for (uint j = gl_LocalInvocationID.x; j < F4; j += wgSize)
+    {
+        uint c = 4u * j;
+        vec4 x4 = bufferI_4f32[base4 + j];
+        vec4 scale4 = vec4(readScale(c), readScale(c + 1u), readScale(c + 2u), readScale(c + 3u));
+        vec4 shift4 = vec4(readShift(c), readShift(c + 1u), readShift(c + 2u), readShift(c + 3u));
+        bufferO_4f32[base4 + j] = x4 * invRms * scale4 + shift4;
+    }
+}
+
+void normalizeScalar(uint base, uint F, float invRms)
+{
+    for (uint j = gl_LocalInvocationID.x; j < F; j += wgSize)
+        writeO(base + j, readI(base + j) * invRms * readScale(j) + readShift(j));
+}
+
+void main()
+{
+    uint row = gl_WorkGroupID.y * gridX + gl_WorkGroupID.x;
+    if (row >= batchSize) return;
+
+    uint tid  = gl_LocalInvocationID.x;
+    uint F    = featSize;
+    uint base = row * F;
+
+    // Phase 1: sum of squares (aligned: vec4 loads)
+    float sumSq = (aligned != 0u) ? accumAligned(base, F) : accumScalar(base, F);
+
+    // Phase 2: reduction — subgroupAdd two-level or shared-memory tree (spec-selected)
+    if (sgReduce != 0u)
+    {
+        sumSq = subgroupAdd(sumSq);
+        if (subgroupElect())
+            sSumSq[gl_SubgroupID] = sumSq;
+        barrier();
+        if (tid == 0u)
+        {
+            float q = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i)
+                q += sSumSq[i];
+            sSumSq[0] = q;
+        }
+        barrier();
+    }
+    else
+    {
+        sSumSq[tid] = sumSq;
+        barrier();
+        for (uint stride = wgSize / 2u; stride > 0u; stride >>= 1)
+        {
+            if (tid < stride)
+                sSumSq[tid] += sSumSq[tid + stride];
+            barrier();
+        }
+    }
+
+    if (tid == 0u)
+        gInvRms = inversesqrt(sSumSq[0] / float(F) + eps);
+    barrier();
+
+    float invRms_g = gInvRms;
+
+    // Phase 3: normalize + scale (+ shift), parallel over features
+    if (aligned != 0u) normalizeAligned(base, F, invRms_g);
+    else               normalizeScalar(base, F, invRms_g);
+}

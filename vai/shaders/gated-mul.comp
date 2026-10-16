@@ -1,0 +1,49 @@
+/*=============================================================================
+ gated-mul.comp:
+     O[r, j] = epilogue( I[r, j] ) * I[r, H + j]   (GLU gating)
+
+ One buffer holds both halves: row r spans 2H elements, the leading H of
+ which take the activation. epilogue names the variant (silu: SwiGLU,
+ gelu: GEGLU, relu: ReGLU, none: bilinear).
+
+ - O (typeO) and I (typeI) are fp32 or fp16, accessed through same-binding
+   buffer aliases. Dispatch (host): one thread per output, workgroups folded
+   over grid x/y and re-linearized here with gridX.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#include "common/activation.h"
+#include "common/spec_constants.h"
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+
+layout(set = 0, binding = 0) buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;       // output elements
+    uint H;       // output width = half the input's
+    uint gridX;   // workgroups along x, so the y fold can be undone here
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+void main()
+{
+    uint e = (gl_WorkGroupID.y * gridX + gl_WorkGroupID.x) * gl_WorkGroupSize.x
+           + gl_LocalInvocationID.x;
+    if (e >= N) return;
+
+    uint row = e / H;
+    uint src = row * 2u * H + (e - row * H);
+
+    writeO(e, applyEpilogue(readI(src)) * readI(src + H));
+}

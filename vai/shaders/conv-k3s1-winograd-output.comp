@@ -1,0 +1,357 @@
+/*=============================================================================
+ Winograd F(4x4,3x3) output transform and fused epilogue.
+ Bindings: O=0, I=1, BIAS=2, SCALE=3, RES=4.
+ Dispatch covers pc.co*Winograd tiles.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 3) const bool shortcut = false;
+layout(constant_id = 4) const bool STORE_MODE = false;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };  // bias
+layout(set = 0, binding = 2) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 3) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };  // scale
+layout(set = 0, binding = 3) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer RES_BUF_F32 { float bufferRes_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer RES_BUF_F16 { float16_t bufferRes_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer RES_BUF_4F32 { vec4 bufferRes_4f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer RES_BUF_4F16 { f16vec4 bufferRes_4f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const float16_t H2 = float16_t(2.0);
+const float16_t H4 = float16_t(4.0);
+const float16_t H8 = float16_t(8.0);
+
+uint winogradTileCount()
+{
+    const uint tilesW = pc.wo / 4u + (pc.wo % 4u != 0u ? 1u : 0u);
+    const uint tilesH = pc.ho / 4u + (pc.ho % 4u != 0u ? 1u : 0u);
+    return tilesW * tilesH;
+}
+
+float readBias(uint c)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[c] : float(bufferBias_f16[c]);
+}
+float readScale(uint c) { return typeP == DTYPE_F32 ? bufferScale_f32[c] : float(bufferScale_f16[c]); }
+float readR(uint offset)
+{
+    return typeI == DTYPE_F32
+        ? bufferRes_f32[offset]
+        : float(bufferRes_f16[offset]);
+}
+float readI32(uint i) { return bufferI_f32[i]; }
+float16_t readI16(uint i) { return bufferI_f16[i]; }
+
+// Affine epilogue and output storage.
+void readAffine(uint c, out float scale, out float bias)
+{
+    bias = readBias(c);
+    scale = (hasScale == 0u) ? 1.0 : readScale(c);
+}
+
+void writeO(
+    uint row,
+    uint col,
+    float rawValue,
+    uint c,
+    uint outH0,
+    uint outW0,
+    float scale,
+    float bias)
+{
+    uint oh = outH0 + row;
+    uint ow = outW0 + col;
+    if (oh >= pc.ho || ow >= pc.wo)
+        return;
+
+    float value = applyEpilogue(
+        hasScale == 0u
+            ? rawValue + bias
+            : scale * rawValue + bias);
+    uint offset = (c * pc.ho + oh) * pc.wo + ow;
+    if (shortcut)
+        value += readR(offset);
+
+    if (typeO == DTYPE_F32)
+        bufferO_f32[offset] = value;
+    else
+        bufferO_f16[offset] = float16_t(value);
+}
+
+void writeOutputRow(
+    uint row,
+    vec4 rawValue,
+    uint c,
+    uint outH0,
+    uint outW0,
+    float scale,
+    float bias)
+{
+    uint oh = outH0 + row;
+    if (!STORE_MODE)
+    {
+        if (oh >= pc.ho)
+            return;
+
+        if (outW0 + 3u >= pc.wo)
+        {
+            writeO(row, 0u, rawValue.x, c, outH0, outW0, scale, bias);
+            writeO(row, 1u, rawValue.y, c, outH0, outW0, scale, bias);
+            writeO(row, 2u, rawValue.z, c, outH0, outW0, scale, bias);
+            writeO(row, 3u, rawValue.w, c, outH0, outW0, scale, bias);
+            return;
+        }
+    }
+
+    vec4 value = applyEpilogue(
+        hasScale == 0u
+            ? rawValue + vec4(bias)
+            : scale * rawValue + vec4(bias));
+    uint base = (c * pc.ho + oh) * pc.wo + outW0;
+
+    if (STORE_MODE)
+    {
+        // The host enables packed stores only when pc.ho and pc.wo are multiples of 4.
+        uint base4 = base >> 2u;
+        if (shortcut)
+        {
+            value += typeI == DTYPE_F16
+                ? vec4(bufferRes_4f16[base4])
+                : bufferRes_4f32[base4];
+        }
+
+        if (typeO == DTYPE_F32)
+            bufferO_4f32[base4] = value;
+        else
+            bufferO_4f16[base4] = f16vec4(value);
+        return;
+    }
+
+    if (shortcut)
+    {
+        value += vec4(
+            readR(base),
+            readR(base + 1u),
+            readR(base + 2u),
+            readR(base + 3u));
+    }
+
+    if (typeO == DTYPE_F32)
+    {
+        bufferO_f32[base] = value.x;
+        bufferO_f32[base + 1u] = value.y;
+        bufferO_f32[base + 2u] = value.z;
+        bufferO_f32[base + 3u] = value.w;
+    }
+    else
+    {
+        bufferO_f16[base] = float16_t(value.x);
+        bufferO_f16[base + 1u] = float16_t(value.y);
+        bufferO_f16[base + 2u] = float16_t(value.z);
+        bufferO_f16[base + 3u] = float16_t(value.w);
+    }
+}
+
+// FP32 output transform.
+void transformRow(
+    float m0,
+    float m1,
+    float m2,
+    float m3,
+    float m4,
+    float m5,
+    out float t0,
+    out float t1,
+    out float t2,
+    out float t3)
+{
+    t0 = m0 + m1 + m2 + m3 + m4;
+    t1 = m1 - m2 + 2.0 * m3 - 2.0 * m4;
+    t2 = m1 + m2 + 4.0 * m3 + 4.0 * m4;
+    t3 = m1 - m2 + 8.0 * m3 - 8.0 * m4 + m5;
+}
+
+void transformTile(uint c, uint tileIdx, out float t[4][6])
+{
+    uint numTiles = winogradTileCount();
+    float m[6][6];
+
+    [[unroll]]
+    for (uint row = 0u; row < 6u; ++row)
+    {
+        [[unroll]]
+        for (uint col = 0u; col < 6u; ++col)
+        {
+            uint index =
+                (row * 6u + col) * pc.co * numTiles +
+                c * numTiles + tileIdx;
+            m[row][col] = readI32(index);
+        }
+    }
+
+    [[unroll]]
+    for (uint col = 0u; col < 6u; ++col)
+    {
+        transformRow(
+            m[0][col], m[1][col], m[2][col],
+            m[3][col], m[4][col], m[5][col],
+            t[0][col], t[1][col], t[2][col], t[3][col]);
+    }
+}
+
+void writeTile(
+    in float t[4][6],
+    uint c,
+    uint outH0,
+    uint outW0,
+    float scale,
+    float bias)
+{
+    [[unroll]]
+    for (uint row = 0u; row < 4u; ++row)
+    {
+        float o0;
+        float o1;
+        float o2;
+        float o3;
+        transformRow(
+            t[row][0], t[row][1], t[row][2],
+            t[row][3], t[row][4], t[row][5],
+            o0, o1, o2, o3);
+        writeOutputRow(
+            row, vec4(o0, o1, o2, o3),
+            c, outH0, outW0, scale, bias);
+    }
+}
+
+// FP16 output transform.
+f16vec4 transformRow(
+    float16_t m0,
+    float16_t m1,
+    float16_t m2,
+    float16_t m3,
+    float16_t m4,
+    float16_t m5)
+{
+    f16vec4 value =
+        f16vec4(m0, float16_t(0.0), float16_t(0.0), float16_t(0.0));
+    value = fma(f16vec4(1.0), f16vec4(m1), value);
+    value = fma(f16vec4(1.0, -1.0, 1.0, -1.0), f16vec4(m2), value);
+    value = fma(f16vec4(1.0, H2, H4, H8), f16vec4(m3), value);
+    value = fma(f16vec4(1.0, -H2, H4, -H8), f16vec4(m4), value);
+    return fma(f16vec4(0.0, 0.0, 0.0, 1.0), f16vec4(m5), value);
+}
+
+void transformTile(
+    uint c,
+    uint tileIdx,
+    out f16vec4 t[6])
+{
+    const uint numTiles = winogradTileCount();
+    const uint transformStride = pc.co * numTiles;
+    const uint tileOffset = c * numTiles + tileIdx;
+
+    [[unroll]]
+    for (uint col = 0u; col < 6u; ++col)
+    {
+        uint index = tileOffset + col * transformStride;
+        t[col] = transformRow(
+            readI16(index),
+            readI16(index + 6u * transformStride),
+            readI16(index + 12u * transformStride),
+            readI16(index + 18u * transformStride),
+            readI16(index + 24u * transformStride),
+            readI16(index + 30u * transformStride));
+    }
+}
+
+void writeTile(
+    in f16vec4 t[6],
+    uint c,
+    uint outH0,
+    uint outW0,
+    float scale,
+    float bias)
+{
+    [[unroll]]
+    for (uint row = 0u; row < 4u; ++row)
+    {
+        writeOutputRow(
+            row,
+            vec4(transformRow(
+                t[0][row], t[1][row], t[2][row],
+                t[3][row], t[4][row], t[5][row])),
+            c, outH0, outW0, scale, bias);
+    }
+}
+
+void main()
+{
+    const uint numTilesW = pc.wo / 4u + (pc.wo % 4u != 0u ? 1u : 0u);
+    const uint numTiles = winogradTileCount();
+
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.co * numTiles)
+        return;
+
+    const uint c = index / numTiles;
+    const uint tileIdx = index % numTiles;
+    const uint tileH = tileIdx / numTilesW;
+    const uint tileW = tileIdx % numTilesW;
+    const uint outH0 = tileH * 4u;
+    const uint outW0 = tileW * 4u;
+
+    float scale;
+    float bias;
+    readAffine(c, scale, bias);
+
+    if (typeW == DTYPE_F16)
+    {
+        f16vec4 t[6];
+
+        transformTile(c, tileIdx, t);
+        writeTile(t, c, outH0, outW0, scale, bias);
+    }
+    else
+    {
+        float t[4][6];
+
+        transformTile(c, tileIdx, t);
+        writeTile(t, c, outH0, outW0, scale, bias);
+    }
+}

@@ -1,0 +1,260 @@
+/*=============================================================================
+ topk-sampling.comp: row-wise top-k sampling over a [M, N] logits tensor
+     out[i] = sample(softmax(top-k(I[i, :]) / temperature), u)
+
+  - I    shape : [M, N]   (typeI logits)
+  - out  shape : [M]      (one raw uint32 sampled index per row)
+  - u    : host uniform in [0, 1), shared by all rows (M == 1 in practice)
+  - cand shape : [M, G*K] uvec2 (valueBits, index) pass-1 candidates
+
+ One kernel run as two passes (host: TopKSamplingNode). Splitting the read
+ across G workgroups keeps the vocabulary sweep off a single shader core; what
+ dominates once it is spread is the k-round merge in step 2.
+
+  - pass 1 (dispatch (G, M), srcCands == 0): workgroup g selects the exact
+    top-k of its ceil(N/G)-logit slice into cand[row][g*k ..]. With G == 1
+    this IS the final pass and writes outIdx, so small vocabularies stay a
+    single dispatch.
+  - pass 2 (dispatch (1, M), srcCands == 1, N = G*k): the same kernel over the
+    candidate pool, which holds the global top-k since every slice
+    contributed its full local one.
+
+ Within a workgroup, selection is a k-round merge instead of k re-scans:
+  1. Each thread insertion-sorts its strided slice elements into a register-
+     resident descending list of perThread entries. The host sizes G so a
+     slice holds at most wgSize*perThread elements — nothing is dropped and
+     the merge is exact. (If the pass-2 pool cap forces G lower, threads
+     truncate and exactness degrades to a Poisson(k/wgSize) argument.)
+  2. k rounds: reduce the wgSize list heads to the round winner (strict
+     (value, index) order), record it, and advance the winning thread's list
+     cursor. The reduction is subgroupMax/Min two-level when the host enables
+     sgReduce (2 barriers per round), else a shared-memory tree.
+  3. Epilogue: pass 1 publishes the k winners as candidates, the final pass
+     runs the temperature softmax over them and the inverse-CDF sample.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#include "common/spec_constants.h"
+
+// Host-selected geometry (TopKSamplingNode::topkTuning): wgSize is a power of
+// two — the shared tree halves it down to 1 — and a slice holds at most
+// wgSize*perThread elements, which is what keeps the per-slice top-k exact.
+layout(constant_id = 0) const uint wgSize    = 512;          // threads per workgroup (= local_size_x)
+layout(constant_id = 1) const uint perThread = 8;            // register list length in use
+layout(constant_id = 2) const uint sgReduce  = 0;            // 1: subgroupMax/Min reduction, 0: shared tree
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;   // I (logits) dtype
+
+layout(local_size_x_id = 0) in;
+
+// Fixed-size, dynamically indexed register lists (insertion sort + cursor).
+// Only the first perThread entries are used, but the budget is charged for
+// L_MAX regardless — a longer list needs a new L_MAX, i.e. a new SPV.
+const uint L_MAX = 8u;
+const uint K_MAX = 128u;          // upper bound on k
+
+// Logits arrive as typeI same-binding aliases; cand carries pass-1 results.
+layout(set = 0, binding = 0) readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 0) readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) writeonly buffer OUT_IDX  { uint  outIdx[];  };
+layout(set = 0, binding = 2) uniform Rand              { float u; };
+layout(set = 0, binding = 3) buffer CAND               { uvec2 cand[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint  M;
+    uint  N;          // pass 1: logits row width; pass 2: candidate count G*k
+    uint  K;
+    float temperature;
+    uint  srcCands;   // 0: read logits (binding 0), 1: read candidates (binding 3)
+};
+
+shared float sVal[wgSize];    // reduction scratch (sgReduce: first gl_NumSubgroups slots)
+shared uint  sIdx[wgSize];
+shared float topV[K_MAX];     // round winners (descending)
+shared uint  topI[K_MAX];
+
+const float NEG_INF = -3.4028235e38;   // -FLT_MAX: finite, so sentinel softmax terms stay NaN-free
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+
+// Strict ordering: a outranks b iff a.val > b.val, ties broken by smaller idx.
+bool outranks(float aVal, uint aIdx, float bVal, uint bIdx)
+{
+    return (aVal > bVal) || (aVal == bVal && aIdx < bIdx);
+}
+
+
+void main()
+{
+    // Rows ride grid y (x carries the slice split); M is asserted host-side.
+    uint row = gl_WorkGroupID.y;
+    if (row >= M) return;
+
+    uint tid      = gl_LocalInvocationID.x;
+    uint wg       = gl_WorkGroupID.x;
+    uint G        = gl_NumWorkGroups.x;
+    uint k        = min(K, N);
+    bool lastPass = (G == 1u);   // pass 1 of 1, or pass 2 — this one samples
+
+    // ---------------------------------------------------------------------
+    // 1. Collect this thread's slice elements into a sorted register list.
+    //    Adjacent lanes read adjacent elements -> coalesced.
+    // ---------------------------------------------------------------------
+    float locV[L_MAX];
+    uint  locI[L_MAX];
+    for (uint j = 0u; j < perThread; ++j) { locV[j] = NEG_INF; locI[j] = 0xffffffffu; }
+
+    uint sliceLen = (N + G - 1u) / G;
+    uint s0 = wg * sliceLen;
+    uint s1 = min(s0 + sliceLen, N);
+
+    for (uint i = s0 + tid; i < s1; i += wgSize)
+    {
+        float v;
+        uint  idx;
+        if (srcCands != 0u)
+        {
+            uvec2 c = cand[row * N + i];
+            v   = uintBitsToFloat(c.x);
+            idx = c.y;
+        }
+        else
+        {
+            v   = readI(row * N + i);
+            idx = i;
+        }
+
+        if (outranks(v, idx, locV[perThread - 1u], locI[perThread - 1u]))
+        {
+            uint p = perThread - 1u;
+            while (p > 0u && outranks(v, idx, locV[p - 1u], locI[p - 1u]))
+            {
+                locV[p] = locV[p - 1u];
+                locI[p] = locI[p - 1u];
+                p--;
+            }
+            locV[p] = v;
+            locI[p] = idx;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 2. k-round merge: k rounds of workgroup-wide head reduction; the winner
+    //    advances its cursor. Exhausted lists sit on the (NEG_INF, ~0u)
+    //    sentinel, which every real entry outranks.
+    // ---------------------------------------------------------------------
+    float headV  = locV[0];
+    uint  headI  = locI[0];
+    uint  cursor = 0u;
+
+    for (uint r = 0u; r < k; ++r)
+    {
+        if (sgReduce != 0u)
+        {
+            // Level 1: subgroup winner = max value, then min index among its
+            // holders (== outranks order). Level 2: subgroup 0 strides over
+            // the per-subgroup partials and reduces the same way.
+            float m  = subgroupMax(headV);
+            uint  mi = subgroupMin(headV == m ? headI : 0xffffffffu);
+            if (subgroupElect())
+            {
+                sVal[gl_SubgroupID] = m;
+                sIdx[gl_SubgroupID] = mi;
+            }
+            barrier();
+
+            if (gl_SubgroupID == 0u)
+            {
+                float bv = NEG_INF;
+                uint  bi = 0xffffffffu;
+                for (uint i = gl_SubgroupInvocationID; i < gl_NumSubgroups; i += gl_SubgroupSize)
+                    if (outranks(sVal[i], sIdx[i], bv, bi)) { bv = sVal[i]; bi = sIdx[i]; }
+
+                float m2  = subgroupMax(bv);
+                uint  mi2 = subgroupMin(bv == m2 ? bi : 0xffffffffu);
+                if (subgroupElect())
+                {
+                    topV[r] = m2;
+                    topI[r] = mi2;
+                }
+            }
+            barrier();
+        }
+        else
+        {
+            sVal[tid] = headV;
+            sIdx[tid] = headI;
+            barrier();
+
+            for (uint stride = wgSize / 2u; stride > 0u; stride >>= 1)
+            {
+                if (tid < stride)
+                {
+                    if (outranks(sVal[tid + stride], sIdx[tid + stride], sVal[tid], sIdx[tid]))
+                    {
+                        sVal[tid] = sVal[tid + stride];
+                        sIdx[tid] = sIdx[tid + stride];
+                    }
+                }
+                barrier();
+            }
+
+            if (tid == 0u)
+            {
+                topV[r] = sVal[0];
+                topI[r] = sIdx[0];
+            }
+            barrier();
+        }
+
+        // The winning thread advances to its next candidate. Indices are
+        // unique, so at most one real head matches; exhausted threads all
+        // match the sentinel winner only once no real entries remain.
+        if (headV == topV[r] && headI == topI[r])
+        {
+            cursor++;
+            if (cursor < perThread) { headV = locV[cursor]; headI = locI[cursor]; }
+            else                    { headV = NEG_INF;      headI = 0xffffffffu;  }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. Epilogue (pass 1 of 2): publish this workgroup's top-k as candidates.
+    // ---------------------------------------------------------------------
+    if (!lastPass)
+    {
+        if (tid < k)
+            cand[(row * G + wg) * k + tid] = uvec2(floatBitsToUint(topV[tid]), topI[tid]);
+        return;
+    }
+
+    // ---------------------------------------------------------------------
+    // 3. Epilogue (final pass): temperature softmax over the top-k, then the
+    //    inverse-CDF sample with u.
+    // ---------------------------------------------------------------------
+    if (tid == 0u)
+    {
+        float invT = 1.0 / max(temperature, 1e-6);
+        float m    = topV[0];   // max logit (numerical stability)
+
+        float Z = 0.0;
+        for (uint r = 0u; r < k; ++r)
+            Z += exp((topV[r] - m) * invT);
+
+        float target = u * Z;
+        float cum    = 0.0;
+        uint  chosen = topI[0];
+        for (uint r = 0u; r < k; ++r)
+        {
+            cum += exp((topV[r] - m) * invT);
+            if (cum >= target)
+            {
+                chosen = topI[r];
+                break;
+            }
+        }
+        outIdx[row] = chosen;
+    }
+}

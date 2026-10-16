@@ -1,0 +1,204 @@
+/*=============================================================================
+ K-split partial reduction + optional reorder or bias/hasScale BN + activation.
+
+ typeW:
+   0: fp32 scalar partials, including row/tensor tails
+   1: packed fp16 partials; requires N % 4 == 0
+
+ reorder:
+   false: split-major partials, followed by hasScale BN and activation
+   true:  Winograd [transform][split][Co * N] fp32 partials, reduced and
+          reordered directly to packed fp16 output
+
+ Spec IDs: 3=aligned vec4, 4=reorder, 100=output dtype,
+ 102=partial dtype, 104=parameter dtype, 111=hasScale, 112=hasBias.
+ Bindings: O=0, I=1, BIAS=2, SCALE=3.
+ Dispatch: one thread per four output elements.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "common/activation.h"
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 3) const bool alignedN = false;    // N % 4 == 0
+layout(constant_id = 4) const bool reorder = false;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 1u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F32 { vec4 bufferI_4f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F16 { f16vec4 bufferI_4f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 2) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 3) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+void writeO(uint index, float value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_f32[index] = value;
+    else
+        bufferO_f16[index] = float16_t(value);
+}
+
+void writeO4(uint index4, vec4 value)
+{
+    if (typeO == DTYPE_F32)
+        bufferO_4f32[index4] = value;
+    else
+        bufferO_4f16[index4] = f16vec4(value);
+}
+
+float readBias(uint m)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[m] : float(bufferBias_f16[m]);
+}
+
+float readScale(uint m)
+{
+    return typeP == DTYPE_F32 ? bufferScale_f32[m] : float(bufferScale_f16[m]);
+}
+
+vec4 applyAffine(uint m, vec4 sum)
+{
+    return hasScale == 0u
+        ? sum + vec4(readBias(m))
+        : fma(sum, vec4(readScale(m)), vec4(readBias(m)));
+}
+
+float applyAffine(uint m, float sum)
+{
+    return hasScale == 0u
+        ? sum + readBias(m)
+        : fma(sum, readScale(m), readBias(m));
+}
+
+void reduceReorder()
+{
+    const uint plane4 = pc.co * pc.n / 4u;
+    const uint total4 = 36u * plane4;
+    const uint index4 = gl_GlobalInvocationID.x;
+    if (index4 >= total4)
+        return;
+
+    const uint transform = index4 / plane4;
+    const uint inner4 = index4 % plane4;
+
+    vec4 sum = vec4(0.0);
+    for (uint split = 0u; split < pc.splitCount; ++split)
+        sum += bufferI_4f32[(transform * pc.splitCount + split) * plane4 + inner4];
+
+    writeO4(index4, sum);
+}
+
+void reduceF16()
+{
+    const uint total4 = pc.co * pc.n / 4u;
+    const uint index4 = gl_GlobalInvocationID.x;
+    if (index4 >= total4)
+        return;
+
+    vec4 sum = vec4(0.0);
+    for (uint split = 0u; split < pc.splitCount; ++split)
+        sum += vec4(bufferI_4f16[split * total4 + index4]);
+
+    const uint m = (index4 * 4u) / pc.n;
+    writeO4(index4, applyEpilogue(applyAffine(m, sum)));
+}
+
+void reduceF32()
+{
+    if (alignedN)
+    {
+        const uint total4 = pc.co * pc.n / 4u;
+        const uint index4 = gl_GlobalInvocationID.x;
+        if (index4 >= total4)
+            return;
+
+        vec4 sum = vec4(0.0);
+        for (uint split = 0u; split < pc.splitCount; ++split)
+            sum += bufferI_4f32[split * total4 + index4];
+
+        const uint m = (index4 * 4u) / pc.n;
+        writeO4(index4, applyEpilogue(applyAffine(m, sum)));
+        return;
+    }
+
+    const uint index = gl_GlobalInvocationID.x * 4u;
+    const uint total = pc.co * pc.n;
+    if (index >= total)
+        return;
+
+    const uint m = index / pc.n;
+    const uint n = index % pc.n;
+    if (index + 3u < total && n + 3u < pc.n)
+    {
+        vec4 sum = vec4(0.0);
+        for (uint split = 0u; split < pc.splitCount; ++split)
+        {
+            const uint partialIndex = split * total + index;
+            sum += vec4(bufferI_f32[partialIndex],
+                        bufferI_f32[partialIndex + 1u],
+                        bufferI_f32[partialIndex + 2u],
+                        bufferI_f32[partialIndex + 3u]);
+        }
+        writeO4(index >> 2u, applyEpilogue(applyAffine(m, sum)));
+        return;
+    }
+
+    for (uint lane = 0u; lane < 4u; ++lane)
+    {
+        const uint scalarIndex = index + lane;
+        if (scalarIndex < total)
+        {
+            float sum = 0.0;
+            for (uint split = 0u; split < pc.splitCount; ++split)
+                sum += bufferI_f32[split * total + scalarIndex];
+
+            const uint scalarM = scalarIndex / pc.n;
+            writeO(
+                scalarIndex,
+                applyEpilogue(applyAffine(scalarM, sum)));
+        }
+    }
+}
+
+void main()
+{
+    if (reorder)
+    {
+        reduceReorder();
+        return;
+    }
+
+    if (typeW == DTYPE_F16)
+        reduceF16();
+    else
+        reduceF32();
+}

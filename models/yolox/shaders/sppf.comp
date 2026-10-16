@@ -1,0 +1,137 @@
+// =============================================================================
+// Fused YOLOX SPP: O = concat(I, maxpool(I), maxpool^2(I), maxpool^3(I)).
+// Repeated stride-1 5x5 max pooling is equivalent to parallel 5/9/13 pooling.
+// One workgroup handles one channel and cooperatively sweeps H*W elements.
+// Bindings: O=0, I=1. Dispatch: dispatch(C).
+// Push constants: C, H, W; host guarantees H*W <= MAX_HW.
+// =============================================================================
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#define FLT_MIN -3.402823466e+38
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = 100) const uint typeO = 0u;
+layout(constant_id = 101) const uint typeI = 0u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint C;
+    uint H;
+    uint W;
+};
+
+const uint MAX_HW = 1024u;
+
+shared float s0[MAX_HW];
+shared float s1[MAX_HW];
+shared float s2[MAX_HW];
+
+float readI(uint i) { return typeI == 0u ? bufferI_f32[i] : float(bufferI_f16[i]); }
+void writeO(uint i, float value)
+{
+    if (typeO == 0u) bufferO_f32[i] = value;
+    else bufferO_f16[i] = float16_t(value);
+}
+
+float loadShared0(int h, int w)
+{
+    if (h < 0 || h >= int(H) || w < 0 || w >= int(W))
+        return FLT_MIN;
+    return s0[uint(h) * W + uint(w)];
+}
+
+float loadShared1(int h, int w)
+{
+    if (h < 0 || h >= int(H) || w < 0 || w >= int(W))
+        return FLT_MIN;
+    return s1[uint(h) * W + uint(w)];
+}
+
+float loadShared2(int h, int w)
+{
+    if (h < 0 || h >= int(H) || w < 0 || w >= int(W))
+        return FLT_MIN;
+    return s2[uint(h) * W + uint(w)];
+}
+
+float pool5From0(uint idx)
+{
+    int h0 = int(idx / W);
+    int w0 = int(idx - uint(h0) * W);
+    float m = FLT_MIN;
+    for (int kh = -2; kh <= 2; ++kh)
+        for (int kw = -2; kw <= 2; ++kw)
+            m = max(m, loadShared0(h0 + kh, w0 + kw));
+    return m;
+}
+
+float pool5From1(uint idx)
+{
+    int h0 = int(idx / W);
+    int w0 = int(idx - uint(h0) * W);
+    float m = FLT_MIN;
+    for (int kh = -2; kh <= 2; ++kh)
+        for (int kw = -2; kw <= 2; ++kw)
+            m = max(m, loadShared1(h0 + kh, w0 + kw));
+    return m;
+}
+
+float pool5From2(uint idx)
+{
+    int h0 = int(idx / W);
+    int w0 = int(idx - uint(h0) * W);
+    float m = FLT_MIN;
+    for (int kh = -2; kh <= 2; ++kh)
+        for (int kw = -2; kw <= 2; ++kw)
+            m = max(m, loadShared2(h0 + kh, w0 + kw));
+    return m;
+}
+
+void main()
+{
+    const uint c = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint hw = H * W;
+    if (c >= C || hw > MAX_HW)
+        return;
+
+    const uint inBase = c * hw;
+    const uint outBase0 = c * hw;
+    const uint outBase1 = (C + c) * hw;
+    const uint outBase2 = (2u * C + c) * hw;
+    const uint outBase3 = (3u * C + c) * hw;
+
+    for (uint i = lane; i < hw; i += gl_WorkGroupSize.x)
+    {
+        float v = readI(inBase + i);
+        s0[i] = v;
+        writeO(outBase0 + i, v);
+    }
+    barrier();
+
+    for (uint i = lane; i < hw; i += gl_WorkGroupSize.x)
+    {
+        float v = pool5From0(i);
+        s1[i] = v;
+        writeO(outBase1 + i, v);
+    }
+    barrier();
+
+    for (uint i = lane; i < hw; i += gl_WorkGroupSize.x)
+    {
+        float v = pool5From1(i);
+        s2[i] = v;
+        writeO(outBase2 + i, v);
+    }
+    barrier();
+
+    for (uint i = lane; i < hw; i += gl_WorkGroupSize.x)
+        writeO(outBase3 + i, pool5From2(i));
+}

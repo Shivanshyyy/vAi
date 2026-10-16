@@ -1,0 +1,783 @@
+/*=============================================================================
+ Winograd-domain FP16 cooperative-matrix GEMM.
+ Bindings: O=0, I=1, W=2.
+ Dispatch: x/y are plan tiles, z=36 transforms times split count.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 0) const uint wgSize = 32u;
+layout(constant_id = 1) const uint wgM = 16u;
+layout(constant_id = 2) const uint wgN = 16u;
+layout(constant_id = 3) const uint sgM = 16u; // M tile dimension computed by each subgroup.
+layout(constant_id = 4) const uint nOffset = 0u;    // for tail
+layout(constant_id = 5) const uint splitK = 0u;
+layout(constant_id = 6) const uint loadMode = 1u; // 0: direct, 1: scalar LDS
+layout(constant_id = 7) const bool storeMode = false; // false: direct coopmat store, true: shared/repacked store
+layout(constant_id = 8) const bool reorder = false;
+layout(constant_id = 9) const bool swapXY = false;
+layout(constant_id = 10) const bool clampN = false; // nvidia clamp N to avoid out-of-bound access in cooperative matrix load/store
+layout(constant_id = 11) const uint panelK = 16u;
+layout(constant_id = 12) const uint sgN = 16u; // N tile dimension computed by each subgroup.
+layout(constant_id = 13) const bool inputReorder = false;
+layout(constant_id = SPEC_ID_TYPE_ACC) const uint typeAcc = 0u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F16 { float16_t bufferI_f16[]; };  // transformed input
+layout(set = 0, binding = 2) restrict readonly  buffer W_BUF_F16 { float16_t bufferW_f16[]; };  // transformed weights
+layout(set = 0, binding = 2) restrict readonly  buffer W_BUF_4F16 { f16vec4 bufferW_4f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint tM = 16u, tN = 16u, tK = 16u;
+const uint sgCountM = wgM / sgM;
+const uint sgCountN = wgN / sgN;
+const uint sgpMIter = sgM / tM;
+const uint sgpNIter = sgN / tN;
+const uint sgCount = sgCountM * sgCountN;
+const uint accFrags = sgpMIter * sgpNIter;
+const uint panelKTiles = panelK / tK;
+const bool PARTIAL_STORE = (sgpNIter == 1u);
+const uint B_TILE_ELEMS = tK * tN;
+const uint C_TILE_ELEMS = tM * tN;
+const uint M_PER_SG = sgM;
+const uint SHARED_ELEMS = wgM * wgN;
+const uint B_SHARED_ELEMS =
+    2u * panelKTiles * sgpNIter * B_TILE_ELEMS;
+const uint sgSize = wgSize / sgCount;
+const uint INPUT_SHARED_ELEMS = loadMode == 1u ? B_SHARED_ELEMS : 1u;
+const uint PARTIAL_STORE_SHARED_ELEMS = !storeMode && PARTIAL_STORE ? sgCount * C_TILE_ELEMS : 1u;
+const uint FP16_STORE_SHARED_ELEMS = storeMode ? SHARED_ELEMS : 1u;
+#define SPEC_MAX(a, b) ((a) > (b) ? (a) : (b))
+shared float16_t SharedH[
+    SPEC_MAX(INPUT_SHARED_ELEMS,
+             SPEC_MAX(PARTIAL_STORE_SHARED_ELEMS,
+                      FP16_STORE_SHARED_ELEMS))];
+shared float SharedF[typeAcc == DTYPE_F16 ? SHARED_ELEMS : 1u];
+
+
+#define matA   coopmat<float16_t, gl_ScopeSubgroup, tM, tK, gl_MatrixUseA>
+#define matB   coopmat<float16_t, gl_ScopeSubgroup, tK, tN, gl_MatrixUseB>
+#define accMatF16 coopmat<float16_t, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+#define accMatF32 coopmat<float, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+
+void writeO(uint i, float16_t value)
+{
+    bufferO_f16[i] = value;
+}
+
+void writeO4(uint i, f16vec4 value)
+{
+    bufferO_4f16[i >> 2u] = value;
+}
+
+void writeO(uint i, float value)
+{
+    bufferO_f16[i] = float16_t(value);
+}
+
+void writeO4(uint i, vec4 value)
+{
+    bufferO_4f16[i >> 2u] = f16vec4(value);
+}
+
+void readIPanel(
+    uint sharedBase,
+    uint batchOffsetI,
+    uint kTileBase,
+    uint kTileCount,
+    uint n0,
+    uint N,
+    bool guardTileN)
+{
+    const uint tilesPerK = sgpNIter * B_TILE_ELEMS;
+    const uint elementCount = kTileCount * tilesPerK;
+    const uint iterCount = elementCount / wgSize +
+        (elementCount % wgSize != 0u ? 1u : 0u);
+    [[unroll]]
+    for (uint iter = 0u; iter < iterCount; ++iter)
+    {
+        uint index =
+            gl_LocalInvocationID.x + iter * wgSize;
+        if (index < elementCount)
+        {
+            uint panelTile = index / tilesPerK;
+            uint tileIndex = index % tilesPerK;
+            uint tile = tileIndex / B_TILE_ELEMS;
+            uint inner = tileIndex % B_TILE_ELEMS;
+            uint kk = inner / tN;
+            uint col = inner % tN;
+            uint k = (kTileBase + panelTile) * tK + kk;
+            uint n = n0 + tile * tN + col;
+            SharedH[sharedBase + index] = (!guardTileN || n < N)
+                ? bufferI_f16[batchOffsetI + k * N + n]
+                : float16_t(0.0);
+        }
+    }
+}
+
+// Preserve the original single-K-tile staging loop for panelK=16. Although it
+// is mathematically equivalent to readIPanel(..., 1, ...), keeping this exact
+// indexing form lets ACO retain the lower-overhead GFX12 schedule.
+void readITiles(
+    uint sharedBase,
+    uint batchOffsetI,
+    uint k0,
+    uint n0,
+    uint N,
+    bool guardTileN)
+{
+    const uint elementCount = sgpNIter * B_TILE_ELEMS;
+    const uint iterCount = elementCount / wgSize +
+        (elementCount % wgSize != 0u ? 1u : 0u);
+    [[unroll]]
+    for (uint iter = 0u; iter < iterCount; ++iter)
+    {
+        uint index =
+            gl_LocalInvocationID.x + iter * wgSize;
+        if (index < elementCount)
+        {
+            uint tile = index / B_TILE_ELEMS;
+            uint inner = index % B_TILE_ELEMS;
+            uint kk = inner / tN;
+            uint col = inner % tN;
+            uint k = k0 + kk;
+            uint n = n0 + tile * tN + col;
+            SharedH[sharedBase + index] = (!guardTileN || n < N)
+                ? bufferI_f16[batchOffsetI + k * N + n]
+                : float16_t(0.0);
+        }
+    }
+}
+
+void writePartialTile(
+    accMatF16 acc,
+    uint base,
+    uint offsetM,
+    uint m0,
+    uint n0,
+    uint N)
+{
+    coopMatStore(acc, SharedH, base, tN, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    for (uint index = gl_SubgroupInvocationID;
+         index < C_TILE_ELEMS;
+         index += sgSize)
+    {
+        uint row = index / tN;
+        uint col = index % tN;
+        uint n = n0 + col;
+        if (n < N)
+            bufferO_f16[offsetM + (m0 + row) * N + n] = SharedH[base + index];
+    }
+}
+
+float16_t readShmem(uint index)
+{
+    return SharedH[index];
+}
+
+uint inputTileBase(
+    uint transform,
+    uint kTile,
+    uint nTile,
+    uint K,
+    uint N)
+{
+    const uint kTiles = K / tK;
+    const uint nTiles = N / tN + (N % tN != 0u ? 1u : 0u);
+    return ((transform * kTiles + kTile) * nTiles + nTile) *
+        B_TILE_ELEMS;
+}
+
+
+void main()
+{
+    const uint M = pc.co;
+    const uint K = pc.ci;
+    const uint N = pc.n;
+    const uint subgroup = gl_SubgroupID;
+    const uint dispatchBatch = gl_WorkGroupID.z;
+    uint batch = dispatchBatch;
+    uint batchSlice = dispatchBatch;
+    uint kTileStart = 0u;
+    uint kTileEnd = K / tK;
+
+    if (splitK != 0u)
+    {
+        uint splitCount = K / splitK;
+        batch = batchSlice / splitCount;
+        uint ks = batchSlice - batch * splitCount;
+        kTileStart = ks * (splitK / tK);
+        kTileEnd = kTileStart + splitK / tK;
+    }
+
+    const uint WM = swapXY ? gl_WorkGroupID.x : gl_WorkGroupID.y;
+    const uint WN = swapXY ? gl_WorkGroupID.y : gl_WorkGroupID.x;
+    const uint mbase = WM * wgM;
+    const uint nbase = nOffset +
+        (clampN
+            ? (N >= wgN
+                ? min(WN * wgN, N - wgN)
+                : 0u)
+            : WN * wgN);
+    const uint subgroupM = subgroup / sgCountN;
+    const uint subgroupN = subgroup - subgroupM * sgCountN;
+    const uint m0 = mbase + subgroupM * sgM;
+    const uint n0 = nbase + subgroupN * sgN;
+
+    const uint batchOffsetU = batch * M * K;
+    const uint batchOffsetV = batch * K * N;
+    uint batchOffsetM =
+        (splitK != 0u ? batchSlice : batch) *
+        M * N;
+    const uint kTiles = K / tK;
+    const uint A4Row0 = (batch * (M / tM) + (m0 / tM)) * kTiles;
+    const bool guardTileN = n0 + wgN > N;
+
+    if (typeAcc == DTYPE_F16)
+    {
+        accMatF32 acc[accFrags];
+        [[unroll]]
+        for (uint i = 0u; i < accFrags; ++i)
+            acc[i] = accMatF32(0.0);
+
+        if (loadMode == 0u)
+        {
+            for (uint kt = kTileStart; kt < kTileEnd; ++kt)
+            {
+                const uint k0 = kt * tK;
+                matA a[sgpMIter];
+                [[unroll]]
+                for (uint mt = 0u; mt < sgpMIter; ++mt)
+                {
+                    if (reorder)
+                    {
+                        coopMatLoad(a[mt], bufferW_4f16,
+                                    (A4Row0 + mt * kTiles + kt) << 6u, 4u,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    else
+                    {
+                        coopMatLoad(
+                            a[mt], bufferW_f16,
+                            batchOffsetU + (m0 + mt * tM) * K + k0,
+                            K, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                }
+                [[unroll]]
+                for (uint nt = 0u; nt < sgpNIter; ++nt)
+                {
+                    matB b;
+                    if (inputReorder)
+                    {
+                        coopMatLoad(
+                            b, bufferI_f16,
+                            inputTileBase(
+                                batch, kt, n0 / tN + nt, K, N),
+                            tN, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    else
+                    {
+                        coopMatLoad(
+                            b, bufferI_f16,
+                            batchOffsetV + k0 * N + n0 + nt * tN,
+                            N, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    [[unroll]]
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                    {
+                        uint index = mt * sgpNIter + nt;
+                        acc[index] = coopMatMulAdd(a[mt], b, acc[index]);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const uint firstPanelTiles =
+                min(panelKTiles, kTileEnd - kTileStart);
+            const uint firstBufferIndex =
+                (kTileStart / panelKTiles) & 1u;
+            readIPanel(
+                firstBufferIndex * panelKTiles *
+                    sgpNIter * B_TILE_ELEMS,
+                batchOffsetV, kTileStart, firstPanelTiles,
+                n0, N, guardTileN);
+            barrier();
+
+            [[dont_unroll]]
+            for (uint panelTileStart = kTileStart;
+                 panelTileStart < kTileEnd;
+                 panelTileStart += panelKTiles)
+            {
+                const uint bufferIndex =
+                    (panelTileStart / panelKTiles) & 1u;
+                const uint sharedBase =
+                    bufferIndex * panelKTiles *
+                        sgpNIter * B_TILE_ELEMS;
+                const uint panelTileEnd =
+                    min(panelTileStart + panelKTiles, kTileEnd);
+                const uint nextPanel = panelTileEnd;
+                const bool hasNext = nextPanel < kTileEnd;
+
+                // Fill the next BK panel before consuming the current one.
+                // Its VMEM latency can overlap the four current-panel WMMAs,
+                // while one workgroup barrier now covers the whole panel.
+                if (hasNext)
+                {
+                    uint nextBufferIndex = 1u - bufferIndex;
+                    const uint nextPanelTiles =
+                        min(panelKTiles, kTileEnd - nextPanel);
+                    readIPanel(
+                        nextBufferIndex * panelKTiles *
+                            sgpNIter * B_TILE_ELEMS,
+                        batchOffsetV, nextPanel, nextPanelTiles,
+                        n0, N, guardTileN);
+                }
+
+                [[unroll]]
+                for (uint kt = panelTileStart;
+                     kt < panelTileEnd;
+                     ++kt)
+                {
+                    const uint k0 = kt * tK;
+                    const uint panelOffset =
+                        (kt - panelTileStart) *
+                        sgpNIter * B_TILE_ELEMS;
+                    matA a[sgpMIter];
+                    matB b[sgpNIter];
+
+                    [[unroll]]
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                    {
+                        if (reorder)
+                        {
+                            coopMatLoad(
+                                a[mt], bufferW_4f16,
+                                (A4Row0 + mt * kTiles + kt) << 6u,
+                                4u, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                        else
+                        {
+                            coopMatLoad(
+                                a[mt], bufferW_f16,
+                                batchOffsetU +
+                                    (m0 + mt * tM) * K + k0,
+                                K, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                    }
+
+                    [[unroll]]
+                    for (uint nt = 0u; nt < sgpNIter; ++nt)
+                        coopMatLoad(
+                            b[nt], SharedH,
+                            sharedBase + panelOffset +
+                                nt * B_TILE_ELEMS,
+                            tN, gl_CooperativeMatrixLayoutRowMajor);
+
+                    [[unroll]]
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                        for (uint nt = 0u; nt < sgpNIter; ++nt)
+                        {
+                            uint index = mt * sgpNIter + nt;
+                            acc[index] = coopMatMulAdd(
+                                a[mt], b[nt], acc[index]);
+                        }
+                }
+
+                if (hasNext)
+                    barrier();
+            }
+        }
+
+        const uint sharedBase = subgroup * M_PER_SG * wgN;
+        [[unroll]]
+        for (uint mt = 0u; mt < sgpMIter; ++mt)
+            for (uint nt = 0u; nt < sgpNIter; ++nt)
+                coopMatStore(
+                    acc[mt * sgpNIter + nt], SharedF,
+                    sharedBase + mt * tM * wgN + nt * tN,
+                    wgN, gl_CooperativeMatrixLayoutRowMajor);
+
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        const uint vectorCount = (M_PER_SG * wgN) >> 2u;
+        for (uint e4 = gl_SubgroupInvocationID;
+             e4 < vectorCount;
+             e4 += sgSize)
+        {
+            uint e = e4 << 2u;
+            uint m = m0 + e / wgN;
+            uint col = n0 + e % wgN;
+            if (m >= M || col >= N)
+                continue;
+            uint src = sharedBase + e;
+            uint dst = batchOffsetM + m * N + col;
+            vec4 value = vec4(
+                SharedF[src], SharedF[src + 1u],
+                SharedF[src + 2u], SharedF[src + 3u]);
+            if (col + 3u < N && (dst & 3u) == 0u)
+                writeO4(dst, value);
+            else
+            {
+                if (col < N) writeO(dst, value.x);
+                if (col + 1u < N) writeO(dst + 1u, value.y);
+                if (col + 2u < N) writeO(dst + 2u, value.z);
+                if (col + 3u < N) writeO(dst + 3u, value.w);
+            }
+        }
+        return;
+    }
+
+    {
+        accMatF16 acc[accFrags];
+        if (loadMode == 0u)
+        {
+            for (uint i = 0u; i < accFrags; ++i)
+                acc[i] = accMatF16(float16_t(0.0));
+
+            for (uint kt = kTileStart; kt < kTileEnd; ++kt)
+            {
+                const uint k0 = kt * tK;
+                matA a[sgpMIter];
+                for (uint mt = 0u; mt < sgpMIter; ++mt)
+                {
+                    if (reorder)
+                    {
+                        coopMatLoad(a[mt], bufferW_4f16,
+                                    (A4Row0 + mt * kTiles + kt) << 6u, 4u,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    else
+                    {
+                        coopMatLoad(
+                            a[mt], bufferW_f16,
+                            batchOffsetU + (m0 + mt * tM) * K + k0,
+                            K, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                }
+                for (uint nt = 0u; nt < sgpNIter; ++nt)
+                {
+                    matB b;
+                    if (inputReorder)
+                    {
+                        coopMatLoad(
+                            b, bufferI_f16,
+                            inputTileBase(
+                                batch, kt, n0 / tN + nt, K, N),
+                            tN, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    else
+                    {
+                        coopMatLoad(
+                            b, bufferI_f16,
+                            batchOffsetV + k0 * N + n0 + nt * tN,
+                            N, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                    {
+                        uint index = mt * sgpNIter + nt;
+                        acc[index] = coopMatMulAdd(a[mt], b, acc[index]);
+                    }
+                }
+            }
+        }
+        else
+        {
+            [[unroll]]
+            for (uint i = 0u; i < accFrags; ++i)
+                acc[i] = accMatF16(float16_t(0.0));
+
+            if (panelK == tK)
+            {
+                const uint firstK = kTileStart * tK;
+                const uint firstBufferIndex = kTileStart & 1u;
+                readITiles(
+                    firstBufferIndex * sgpNIter * B_TILE_ELEMS,
+                    batchOffsetV, firstK, n0, N, guardTileN);
+                barrier();
+
+                [[dont_unroll]]
+                for (uint kt = kTileStart; kt < kTileEnd; ++kt)
+                {
+                    const uint k0 = kt * tK;
+                    const uint bufferIndex = kt & 1u;
+                    const uint sharedBase =
+                        bufferIndex * sgpNIter * B_TILE_ELEMS;
+                    const uint nextK = k0 + tK;
+                    const bool hasNext = kt + 1u < kTileEnd;
+                    matA a[sgpMIter];
+                    matB b[sgpNIter];
+
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                    {
+                        if (reorder)
+                        {
+                            coopMatLoad(a[mt], bufferW_4f16,
+                                        (A4Row0 + mt * kTiles + kt) << 6u,
+                                        4u,
+                                        gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                        else
+                        {
+                            coopMatLoad(
+                                a[mt], bufferW_f16,
+                                batchOffsetU + (m0 + mt * tM) * K + k0,
+                                K, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                    }
+
+                    [[unroll]]
+                    for (uint nt = 0u; nt < sgpNIter; ++nt)
+                    {
+                        coopMatLoad(
+                            b[nt], SharedH,
+                            sharedBase + nt * B_TILE_ELEMS,
+                            tN, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+
+                    if (hasNext)
+                    {
+                        uint nextBufferIndex = 1u - bufferIndex;
+                        readITiles(
+                            nextBufferIndex * sgpNIter * B_TILE_ELEMS,
+                            batchOffsetV, nextK, n0, N, guardTileN);
+                    }
+
+                    [[unroll]]
+                    for (uint mt = 0u; mt < sgpMIter; ++mt)
+                    {
+                        for (uint nt = 0u; nt < sgpNIter; ++nt)
+                        {
+                            uint index = mt * sgpNIter + nt;
+                            acc[index] =
+                                coopMatMulAdd(a[mt], b[nt], acc[index]);
+                        }
+                    }
+
+                    if (hasNext)
+                        barrier();
+                }
+            }
+            else
+            {
+                const uint firstPanelTiles =
+                    min(panelKTiles, kTileEnd - kTileStart);
+                const uint firstBufferIndex =
+                    (kTileStart / panelKTiles) & 1u;
+                readIPanel(
+                    firstBufferIndex * panelKTiles *
+                        sgpNIter * B_TILE_ELEMS,
+                    batchOffsetV, kTileStart, firstPanelTiles,
+                    n0, N, guardTileN);
+                barrier();
+
+                [[dont_unroll]]
+                for (uint panelTileStart = kTileStart;
+                     panelTileStart < kTileEnd;
+                     panelTileStart += panelKTiles)
+                {
+                    const uint bufferIndex =
+                        (panelTileStart / panelKTiles) & 1u;
+                    const uint sharedBase =
+                        bufferIndex * panelKTiles *
+                            sgpNIter * B_TILE_ELEMS;
+                    const uint panelTileEnd =
+                        min(panelTileStart + panelKTiles, kTileEnd);
+                    const uint nextPanel = panelTileEnd;
+                    const bool hasNext = nextPanel < kTileEnd;
+
+                    if (hasNext)
+                    {
+                        uint nextBufferIndex = 1u - bufferIndex;
+                        const uint nextPanelTiles =
+                            min(panelKTiles, kTileEnd - nextPanel);
+                        readIPanel(
+                            nextBufferIndex * panelKTiles *
+                                sgpNIter * B_TILE_ELEMS,
+                            batchOffsetV, nextPanel, nextPanelTiles,
+                            n0, N, guardTileN);
+                    }
+
+                    [[unroll]]
+                    for (uint kt = panelTileStart;
+                         kt < panelTileEnd;
+                         ++kt)
+                    {
+                        const uint k0 = kt * tK;
+                        const uint panelOffset =
+                            (kt - panelTileStart) *
+                            sgpNIter * B_TILE_ELEMS;
+                        matA a[sgpMIter];
+                        matB b[sgpNIter];
+
+                        [[unroll]]
+                        for (uint mt = 0u; mt < sgpMIter; ++mt)
+                        {
+                            if (reorder)
+                            {
+                                coopMatLoad(
+                                    a[mt], bufferW_4f16,
+                                    (A4Row0 + mt * kTiles + kt) << 6u,
+                                    4u,
+                                    gl_CooperativeMatrixLayoutRowMajor);
+                            }
+                            else
+                            {
+                                coopMatLoad(
+                                    a[mt], bufferW_f16,
+                                    batchOffsetU +
+                                        (m0 + mt * tM) * K + k0,
+                                    K, gl_CooperativeMatrixLayoutRowMajor);
+                            }
+                        }
+
+                        [[unroll]]
+                        for (uint nt = 0u; nt < sgpNIter; ++nt)
+                            coopMatLoad(
+                                b[nt], SharedH,
+                                sharedBase + panelOffset +
+                                    nt * B_TILE_ELEMS,
+                                tN, gl_CooperativeMatrixLayoutRowMajor);
+
+                        [[unroll]]
+                        for (uint mt = 0u; mt < sgpMIter; ++mt)
+                            for (uint nt = 0u; nt < sgpNIter; ++nt)
+                            {
+                                uint index = mt * sgpNIter + nt;
+                                acc[index] = coopMatMulAdd(
+                                    a[mt], b[nt], acc[index]);
+                            }
+                    }
+
+                    if (hasNext)
+                        barrier();
+                }
+            }
+        }
+
+        if (!storeMode)
+        {
+            [[unroll]]
+            for (uint mt = 0u; mt < sgpMIter; ++mt)
+            {
+                uint tileM0 = m0 + mt * tM;
+                for (uint nt = 0u; nt < sgpNIter; ++nt)
+                {
+                    uint tileN0 = n0 + nt * tN;
+                    if (tileN0 >= N)
+                        continue;
+                    uint index = mt * sgpNIter + nt;
+                    if (tileN0 + tN <= N)
+                    {
+                        coopMatStore(
+                            acc[index], bufferO_f16,
+                            batchOffsetM + tileM0 * N + tileN0,
+                            N, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                    else if (PARTIAL_STORE)
+                    {
+                        barrier();
+                        writePartialTile(
+                            acc[index], subgroup * C_TILE_ELEMS,
+                            batchOffsetM, tileM0, tileN0, N);
+                    }
+                }
+            }
+            return;
+        }
+
+        if (loadMode == 1u)
+            barrier();
+
+        uint sharedBase = subgroup * M_PER_SG * wgN;
+        for (uint mt = 0u; mt < sgpMIter; ++mt)
+        {
+            for (uint nt = 0u; nt < sgpNIter; ++nt)
+            {
+                coopMatStore(acc[mt * sgpNIter + nt], SharedH,
+                             sharedBase + mt * tM * wgN + nt * tN,
+                             wgN,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint lane = gl_SubgroupInvocationID;
+    uint sharedBase = subgroup * M_PER_SG * wgN;
+    if (splitK == 0u)
+    {
+        const uint vectorCount = (M_PER_SG * wgN) >> 2u;
+
+        for (uint e4 = lane;
+             e4 < vectorCount;
+             e4 += sgSize)
+        {
+            uint e = e4 << 2u;
+            uint m = m0 + e / wgN;
+            uint col = n0 + e % wgN;
+            if (col >= N)
+                continue;
+            uint src = sharedBase + e;
+            uint dst = batchOffsetM + m * N + col;
+            if (col + 3u < N && (dst & 3u) == 0u)
+            {
+                bufferO_4f16[dst >> 2u] = f16vec4(SharedH[src], SharedH[src + 1u],
+                                                    SharedH[src + 2u], SharedH[src + 3u]);
+            }
+            else
+            {
+                if (col < N)
+                    writeO(dst, readShmem(src));
+                if (col + 1u < N)
+                    writeO(dst + 1u, readShmem(src + 1u));
+                if (col + 2u < N)
+                    writeO(dst + 2u, readShmem(src + 2u));
+                if (col + 3u < N)
+                    writeO(dst + 3u, readShmem(src + 3u));
+            }
+        }
+        return;
+    }
+
+    for (uint e = lane;
+         e < M_PER_SG * wgN;
+         e += sgSize)
+    {
+        uint m = m0 + e / wgN;
+        uint col = n0 + e % wgN;
+        if (col < N)
+            bufferO_f32[batchOffsetM + m * N + col] = float(SharedH[sharedBase + e]);
+    }
+}

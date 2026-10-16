@@ -1,0 +1,289 @@
+/*=============================================================================
+ vAi shader naming: vai-<op>-<algorithm>[-<arch>]-<dtype>[-w32|w64]
+ Tuning fields: op=conv-k3s1; algorithm=winograd-gemm; path=generic; dtype=specialized; wave=specialized
+ Winograd-domain GEMM with FP32/FP16 storage and float arithmetic.
+ Bindings: O=0, I=1, W=2.
+ Dispatch: x=pc.n tiles, y=Co tiles, z=36 transforms.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const uint wgM = 128u;
+layout(constant_id = 2) const uint wgN = 64u;
+layout(constant_id = 3) const uint wgK = 8u;
+layout(constant_id = 4) const uint tM = 8u;
+layout(constant_id = 5) const uint tN = 4u;
+layout(constant_id = 6) const uint pad = 0u;
+layout(constant_id = 7) const bool alignM = true;
+layout(constant_id = 8) const bool alignN = false;
+layout(constant_id = 9) const bool alignK = true;
+layout(constant_id = 10) const bool storeMode = false; // false: scalar output, true: vec4 output
+layout(constant_id = 11) const bool loadMode = false; // false: scalar staging, true: vec4 staging
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 2) restrict readonly  buffer W_BUF_F32 { float bufferW_f32[]; };
+layout(set = 0, binding = 2) restrict readonly  buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint A_STRIDE = wgM + 4u;
+const uint B_STRIDE = wgN + pad;
+const uint A_ELEMS = wgK * A_STRIDE;
+const uint B_ELEMS = wgK * B_STRIDE;
+const uint B4_ELEMS = wgK * wgN / 4u;
+
+shared float As[2][typeW == DTYPE_F32 ? A_ELEMS : 1u];
+shared float Bs[2][typeW == DTYPE_F32 ? B_ELEMS : 1u];
+shared vec4 B4s[2][typeW == DTYPE_F32 ? B4_ELEMS : 1u];
+shared float16_t As16[2][typeW == DTYPE_F16 ? A_ELEMS : 1u];
+shared float16_t Bs16[2][typeW == DTYPE_F16 ? B_ELEMS : 1u];
+shared f16vec4 B4s16[2][typeW == DTYPE_F16 ? B4_ELEMS : 1u];
+
+float readI(uint index) { return typeW == DTYPE_F32 ? bufferI_f32[index] : float(bufferI_f16[index]); }
+float readW(uint index) { return typeW == DTYPE_F32 ? bufferW_f32[index] : float(bufferW_f16[index]); }
+
+// TODO: Investigate NVIDIA specialization/DCE codegen for the dual FP32/FP16 shared-memory paths.
+// Keep the FP16 specialization first as a temporary workaround for the observed performance regression.
+// Replace this workaround after the driver codegen root cause is understood.
+void writeA(uint page, uint index, float value)
+{
+    if (typeW == DTYPE_F16) As16[page][index] = float16_t(value);
+    else As[page][index] = value;
+}
+
+float readA(uint page, uint index)
+{
+    return typeW == DTYPE_F16 ? float(As16[page][index]) : As[page][index];
+}
+
+void writeB(uint page, uint index, float value)
+{
+    if (typeW == DTYPE_F16) Bs16[page][index] = float16_t(value);
+    else Bs[page][index] = value;
+}
+
+void writeB4(uint page, uint index, vec4 value)
+{
+    if (typeW == DTYPE_F16) B4s16[page][index] = f16vec4(value);
+    else B4s[page][index] = value;
+}
+
+void writeO(uint i, uint n0, vec4 v)
+{
+    if (n0 >= pc.n)
+        return;
+    uint remaining = pc.n - n0;
+    if (storeMode)
+    {
+        if (remaining >= 4u)
+        {
+            if (typeW == DTYPE_F32) bufferO_4f32[i >> 2u] = v;
+            else bufferO_4f16[i >> 2u] = f16vec4(v);
+        }
+        return;
+    }
+
+    if (typeW == DTYPE_F32)
+    {
+        bufferO_f32[i] = v.x;
+        if (remaining > 1u) bufferO_f32[i + 1u] = v.y;
+        if (remaining > 2u) bufferO_f32[i + 2u] = v.z;
+        if (remaining > 3u) bufferO_f32[i + 3u] = v.w;
+    }
+    else
+    {
+        bufferO_f16[i] = float16_t(v.x);
+        if (remaining > 1u) bufferO_f16[i + 1u] = float16_t(v.y);
+        if (remaining > 2u) bufferO_f16[i + 2u] = float16_t(v.z);
+        if (remaining > 3u) bufferO_f16[i + 3u] = float16_t(v.w);
+    }
+
+}
+
+vec4 readI4(uint i, uint n0)
+{
+    if (n0 >= pc.n)
+        return vec4(0.0);
+    uint remaining = pc.n - n0;
+    if (remaining >= 4u)
+        return vec4(readI(i), readI(i + 1u), readI(i + 2u), readI(i + 3u));
+
+    vec4 v = vec4(0.0);
+    v.x = readI(i);
+    if (remaining > 1u) v.y = readI(i + 1u);
+    if (remaining > 2u) v.z = readI(i + 2u);
+    if (remaining > 3u) v.w = readI(i + 3u);
+    return v;
+}
+
+vec4 readBs(uint page, uint dotIdx, uint t_n)
+{
+    if (loadMode)
+    {
+        uint index = dotIdx * (wgN / 4u) + t_n;
+        return typeW == DTYPE_F16 ? vec4(B4s16[page][index]) : B4s[page][index];
+    }
+
+    uint bBase = dotIdx * B_STRIDE + t_n * tN;
+    return typeW == DTYPE_F16
+        ? vec4(Bs16[page][bBase], Bs16[page][bBase + 1u], Bs16[page][bBase + 2u], Bs16[page][bBase + 3u])
+        : vec4(Bs[page][bBase], Bs[page][bBase + 1u], Bs[page][bBase + 2u], Bs[page][bBase + 3u]);
+}
+
+void readWTile(uint page, uint batchOffsetW, uint k0, uint innerRowA,
+              uint innerColA, uint rowStrideA, uint m0base, uint aLoadBase)
+{
+    uint k = k0 + innerColA;
+    for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+    {
+        uint m = m0base + bm;
+        writeA(page, aLoadBase + bm,
+            (alignM || m < pc.co) && (alignK || k < pc.ci)
+                ? readW(batchOffsetW + m * pc.ci + k)
+                : 0.0);
+    }
+}
+
+void readITile(uint page, uint batchOffsetI, uint k0, uint innerRowB,
+              uint innerColB, uint rowStrideB, uint n0base)
+{
+    if (loadMode)
+    {
+        for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+        {
+            uint kkLocal = innerRowB + bk;
+            if (kkLocal < wgK)
+            {
+                uint index = batchOffsetI + (k0 + kkLocal) * pc.n + n0base;
+                writeB4(page, kkLocal * (wgN / 4u) + innerColB, readI4(index, n0base));
+            }
+        }
+    }
+    else
+    {
+        for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+        {
+            uint kkLocal = innerRowB + bk;
+            uint kk = k0 + kkLocal;
+            writeB(page, kkLocal * B_STRIDE + innerColB,
+                (alignK || kk < pc.ci) && (alignN || n0base < pc.n)
+                    ? readI(batchOffsetI + kk * pc.n + n0base)
+                    : 0.0);
+        }
+    }
+}
+
+void main()
+{
+    uint tileCol = gl_WorkGroupID.x;
+    uint tileRow = gl_WorkGroupID.y;
+    uint batch = gl_WorkGroupID.z;
+    uint t = gl_LocalInvocationID.x;
+    uint T = gl_WorkGroupSize.x;
+
+    uint batchOffsetW = batch * pc.co * pc.ci;
+    uint batchOffsetI = batch * pc.ci * pc.n;
+    uint batchOffsetM = batch * pc.co * pc.n;
+
+    uint innerRowA = t / wgK;
+    uint innerColA = t % wgK;
+    uint rowStrideA = T / wgK;
+
+    uint bColsPerThreadGroup = loadMode ? (wgN / tN) : wgN;
+    uint innerRowB = t / bColsPerThreadGroup;
+    uint innerColB = t % bColsPerThreadGroup;
+    uint rowStrideB = T / bColsPerThreadGroup;
+
+    uint t_n = t % (wgN / tN);
+    uint t_m = t / (wgN / tN);
+
+    uint m0base = tileRow * wgM + innerRowA;
+    uint n0base = loadMode
+        ? tileCol * wgN + innerColB * tN
+        : tileCol * wgN + innerColB;
+    uint aLoadBase = innerColA * A_STRIDE + innerRowA;
+
+    vec4 acc[8];
+    for (uint i = 0u; i < 8; ++i)
+    {
+        if (i < tM)
+            acc[i] = vec4(0.0);
+    }
+
+    uint numKTiles = alignK
+        ? pc.ci / wgK
+        : pc.ci / wgK + (pc.ci % wgK != 0u ? 1u : 0u);
+    uint cur = 0u;
+
+    readWTile(0u, batchOffsetW, 0u, innerRowA, innerColA, rowStrideA, m0base, aLoadBase);
+    readITile(0u, batchOffsetI, 0u, innerRowB, innerColB, rowStrideB, n0base);
+    barrier();
+
+    for (uint ki = 0u; ki < numKTiles; ++ki)
+    {
+        uint nxt = 1u - cur;
+
+        if (ki + 1u < numKTiles)
+        {
+            uint k0next = (ki + 1u) * wgK;
+            readWTile(nxt, batchOffsetW, k0next, innerRowA, innerColA, rowStrideA, m0base, aLoadBase);
+            readITile(nxt, batchOffsetI, k0next, innerRowB, innerColB, rowStrideB, n0base);
+        }
+
+        for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+        {
+            uint aBase = dotIdx * A_STRIDE + t_m * tM;
+            vec4 rN = readBs(cur, dotIdx, t_n);
+
+            for (uint i = 0u; i < 8u; ++i)
+            {
+                if (i < tM)
+                    acc[i] += readA(cur, aBase + i) * rN;
+            }
+
+        }
+
+        if (ki + 1u < numKTiles)
+            barrier();
+        cur = nxt;
+    }
+
+    uint m0 = tileRow * wgM + t_m * tM;
+    uint n0 = tileCol * wgN + t_n * tN;
+
+    for (uint i = 0u; i < 8u; ++i)
+    {
+        if (i < tM)
+        {
+            if (alignM || m0 + i < pc.co)
+            {
+                uint index = batchOffsetM + (m0 + i) * pc.n + n0;
+                writeO(index, n0, acc[i]);
+            }
+        }
+
+    }
+}

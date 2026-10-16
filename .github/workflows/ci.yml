@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# pull-requests:read — the paths filter lists a PR's changed files by API.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Job-level `if:` rather than a workflow-level `paths:` — a skipped job still
+  # reports, so a required check does not hang. A skipped workflow reports
+  # nothing and leaves the PR pending forever.
+  filter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      cpp: ${{ steps.filter.outputs.cpp }}
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          # `every` makes the pattern list a conjunction, so these negations
+          # read "none of the below" — a lone !(a|b) extglob does not: probed
+          # with an md-only PR, it matched README.md and built everything.
+          # Negated, so anything unrecognised still builds. The python build
+          # compiles the C++ core too, so `code` is `cpp` plus python/**.
+          predicate-quantifier: every
+          filters: |
+            cpp:
+              - '!python/**'
+              - '!docs/**'
+              - '!mkdocs.yml'
+              - '!**/*.md'
+            code:
+              - '!docs/**'
+              - '!mkdocs.yml'
+              - '!**/*.md'
+
+  vai-linux:
+    needs: filter
+    if: github.event_name == 'workflow_dispatch' || needs.filter.outputs.cpp == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # `this auto&&` (C++23 explicit object parameters) needs GCC 14; the
+    # runner's default gcc is 13.
+    env:
+      CC: gcc-14
+      CXX: g++-14
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14 g++-14 ninja-build glslc libvulkan-dev spirv-headers
+
+      - uses: hendrikmuhs/ccache-action@v1.2.23   # `v1` still ships node20
+        with:
+          key: build-ubuntu-24.04
+          save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # VAI_BUILD_BENCH compiles the vAi-side benches; the comparison targets
+      # need their runtimes and are skipped on a bare runner by find_package.
+      - name: Build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVAI_BUILD_EXAMPLES=ON \
+            -DVAI_BUILD_BENCH=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build -j"$(nproc)"
+
+  vai-windows:
+    needs: filter
+    if: github.event_name == 'workflow_dispatch' || needs.filter.outputs.cpp == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    env:
+      VULKAN_SDK_VERSION: 1.4.357.0
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - uses: actions/cache@v5
+        with:
+          path: C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-${{ env.VULKAN_SDK_VERSION }}
+
+      # A restored cache does not set VULKAN_SDK, which FindVulkan needs.
+      # Probe a file the install ends on, not the directory — a failed install
+      # can leave a partial directory behind, and the cache would pin it.
+      - name: Vulkan SDK
+        run: |
+          $sdk = "C:\VulkanSDK\$env:VULKAN_SDK_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) {
+            curl.exe -L -o "$env:RUNNER_TEMP\vulkan-sdk.exe" `
+              "https://sdk.lunarg.com/sdk/download/$env:VULKAN_SDK_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_SDK_VERSION.exe"
+            & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
+          }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+
+      # Ninja needs cl.exe on PATH; the VS generator set it up on its own.
+      - uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          variant: sccache            # ccache cannot wrap MSVC cl.exe
+          key: build-windows-2025
+          save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # Ninja Multi-Config keeps the multi-config coverage the VS generator gave,
+      # and is the only multi-config generator that honours a compiler launcher.
+      - name: Build
+        run: |
+          cmake -B build -G "Ninja Multi-Config" `
+            -DVAI_BUILD_EXAMPLES=ON `
+            -DVAI_BUILD_BENCH=ON `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          cmake --build build --config Release
+
+  # Keyed off `code`, not a python-only filter: pip builds the C++ core into
+  # the extension, so a C++ change can break the bindings without touching
+  # python/**.
+  pyvai-linux:
+    needs: filter
+    if: github.event_name == 'workflow_dispatch' || needs.filter.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    # The C++ core needs GCC 14, as in vai-linux; pip's CMake reads CC / CXX too.
+    env:
+      CC: gcc-14
+      CXX: g++-14
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # mesa-vulkan-drivers is lavapipe, the only ICD on a GPU-less runner.
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-14 g++-14 ninja-build glslc libvulkan-dev spirv-headers mesa-vulkan-drivers
+
+      # ubuntu-24.04's system python is PEP 668 externally-managed.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip                  # wheel downloads; the build itself is ccache's job
+          cache-dependency-path: pyproject.toml
+
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: python-ubuntu-24.04
+          save: ${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Install
+        run: |
+          pip install -e ".[test]" \
+            --config-settings=cmake.define.CMAKE_C_COMPILER_LAUNCHER=ccache \
+            --config-settings=cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      # Tests without committed weights skip themselves.
+      - name: Test
+        run: pytest -q

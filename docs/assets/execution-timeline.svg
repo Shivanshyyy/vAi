@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 380" width="1080" height="380"
+     font-family="'Segoe UI', system-ui, -apple-system, sans-serif" role="img"
+     aria-label="Timeline of three consecutive model() calls across the user, NeuralNet, and GPU lanes. Only call 1 runs graph preparation and command buffer recording; the GPU keeps running after the call returns; the next call waits for the previous forward to finish">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#14556b"/>
+    </marker>
+    <style>
+      .box   { fill: #9fd3e8; stroke: #111; stroke-width: 2.5; }
+      .cond  { stroke-dasharray: 9 7; }
+      .hl    { fill: #22e0e0; }
+      .title { font-size: 17px; font-weight: 600; fill: #000; text-anchor: middle; }
+      .slot  { font-size: 17px; fill: #000; text-anchor: middle; }
+      .wire  { stroke: #14556b; stroke-width: 2.5; stroke-dasharray: 9 7; fill: none; }
+      .lane  { stroke: #14556b; stroke-width: 1; opacity: .3; }
+      .tick  { stroke: #14556b; stroke-width: 1.5; stroke-dasharray: 3 5; opacity: .6; }
+
+      /* 상자 밖 글자는 페이지 배경 위에 놓인다 — 테마를 따라간다. */
+      .cap      { font-size: 18px; font-weight: 600; fill: #111; }
+      .cap-item { font-size: 17px; fill: #111; }
+      .lbl      { font-size: 16px; fill: #111; }
+      @media (prefers-color-scheme: dark) {
+        .cap, .cap-item, .lbl { fill: #d7dde3; }
+      }
+    </style>
+  </defs>
+
+  <!-- ── 레인 ── -->
+  <line class="lane" x1="110" y1="90"  x2="1080" y2="90"/>
+  <line class="lane" x1="110" y1="190" x2="1080" y2="190"/>
+  <line class="lane" x1="110" y1="290" x2="1080" y2="290"/>
+  <text class="cap" x="16" y="96">User</text>
+  <text class="cap" x="16" y="196">NeuralNet</text>
+  <text class="cap" x="16" y="296">GPU</text>
+
+  <!-- ── 열 제목 ── -->
+  <text class="cap" x="342" y="28" text-anchor="middle">Call 1</text>
+  <text class="cap" x="652" y="28" text-anchor="middle">Call 2</text>
+  <text class="cap" x="905" y="28" text-anchor="middle">Call 3</text>
+
+  <!-- ── forward 완료 시점 눈금 ── -->
+  <line class="tick" x1="520" y1="56" x2="520" y2="322"/>
+  <line class="tick" x1="880" y1="56" x2="880" y2="322"/>
+
+  <!-- ══ 1회차 ══ -->
+  <rect class="box" x="120" y="72" width="70" height="36" rx="18"/>
+  <text class="slot" x="155" y="96">model()</text>
+
+  <rect class="box" x="120" y="172" width="70" height="36" rx="8"/>
+  <text class="slot" x="155" y="196">1–5</text>
+  <rect class="box cond" x="194" y="172" width="50" height="36" rx="8"/>
+  <text class="slot" x="219" y="196">6</text>
+  <rect class="box cond" x="248" y="172" width="50" height="36" rx="8"/>
+  <text class="slot" x="273" y="196">7</text>
+  <rect class="box" x="302" y="172" width="50" height="36" rx="8"/>
+  <text class="slot" x="327" y="196">8</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 327 208 L 345 266"/>
+  <rect class="box" x="340" y="266" width="180" height="48" rx="8"/>
+  <rect class="hl" x="352" y="274" width="156" height="22"/>
+  <text class="title" x="430" y="291">forward 1</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 352 172 L 352 108"/>
+  <text class="lbl" x="344" y="142" text-anchor="end">returns out handle</text>
+
+  <rect class="box" x="360" y="72" width="70" height="36" rx="18"/>
+  <text class="slot" x="395" y="96">downloadToHost()</text>
+  <path class="wire" marker-end="url(#arrow)" d="M 430 90 L 516 90"/>
+  <text class="lbl" x="473" y="66" text-anchor="middle">waits on fence</text>
+  <rect class="box" x="524" y="72" width="56" height="36" rx="18"/>
+  <text class="slot" x="552" y="96">value</text>
+
+  <!-- ══ 2회차 (읽지 않고 바로 3회차로) ══ -->
+  <rect class="box" x="590" y="72" width="70" height="36" rx="18"/>
+  <text class="slot" x="625" y="96">model()</text>
+
+  <rect class="box" x="590" y="172" width="70" height="36" rx="8"/>
+  <text class="slot" x="625" y="196">1–5</text>
+  <rect class="box" x="664" y="172" width="50" height="36" rx="8"/>
+  <text class="slot" x="689" y="196">8</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 689 208 L 707 266"/>
+  <rect class="box" x="702" y="266" width="178" height="48" rx="8"/>
+  <rect class="hl" x="714" y="274" width="154" height="22"/>
+  <text class="title" x="791" y="291">forward 2</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 714 172 L 714 108"/>
+
+  <!-- ══ 3회차 (forward 2가 아직 도는 중에 호출) ══ -->
+  <rect class="box" x="730" y="72" width="70" height="36" rx="18"/>
+  <text class="slot" x="765" y="96">model()</text>
+
+  <rect class="box" x="730" y="172" width="160" height="36" rx="8"/>
+  <text class="slot" x="810" y="196">1–5 · waits in 2</text>
+  <rect class="box" x="894" y="172" width="50" height="36" rx="8"/>
+  <text class="slot" x="919" y="196">8</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 919 208 L 937 266"/>
+  <rect class="box" x="932" y="266" width="160" height="48" rx="8"/>
+  <rect class="hl" x="944" y="274" width="124" height="22"/>
+  <text class="title" x="1006" y="291">forward 3</text>
+
+  <path class="wire" marker-end="url(#arrow)" d="M 944 172 L 944 108"/>
+
+  <rect class="box cond" x="948" y="72" width="130" height="36" rx="18"/>
+  <text class="slot" x="1013" y="96">read call 2 out</text>
+  <text class="lbl" x="1078" y="62" text-anchor="end">fails: buffer already overwritten by call 3</text>
+
+  <!-- ── 눈금 설명 ── -->
+  <text class="lbl" x="520" y="340" text-anchor="middle">forward 1 done · downloadToHost() wakes up</text>
+  <text class="lbl" x="880" y="340" text-anchor="middle">forward 2 done · syncPrevForward() wakes up</text>
+
+  <!-- ── 범례 ── -->
+  <text class="cap" x="120" y="344">Step boxes:</text>
+  <rect class="box" x="120" y="352" width="24" height="16" rx="4"/>
+  <text class="cap-item" x="152" y="365">every call</text>
+  <rect class="box cond" x="250" y="352" width="24" height="16" rx="4"/>
+  <text class="cap-item" x="282" y="365">conditional</text>
+</svg>

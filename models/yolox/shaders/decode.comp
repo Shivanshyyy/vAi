@@ -1,0 +1,138 @@
+// =============================================================================
+// YOLOX decode: consume split regobj/cls heads and produce anchor-major
+// [N,5+classes] without materializing concatenated per-scale tensors.
+// Box centers add their grid coordinate, box sizes use exp, and object/class
+// logits use sigmoid. Bindings: P3 regobj/cls=0..1, P4=2..3,
+// P5=4..5, O=6.
+// =============================================================================
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "common/spec_constants.h"
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+
+layout(constant_id = 0) const uint N = 0u;
+layout(constant_id = 1) const uint numClasses = 0u;
+layout(constant_id = 2) const uint p3N = 0u;
+layout(constant_id = 3) const uint p4N = 0u;
+layout(constant_id = 4) const uint p5N = 0u;
+layout(constant_id = 5) const uint p3Size = 0u;
+layout(constant_id = 6) const uint p4Size = 0u;
+layout(constant_id = 7) const uint p5Size = 0u;
+layout(constant_id = 8) const uint imageSize = 0u;
+
+layout(set = 0, binding = 0) readonly buffer P3_REGOBJ_BUF_F32 { float bufferP3RegObj_f32[]; };
+layout(set = 0, binding = 0) readonly buffer P3_REGOBJ_BUF_F16 { float16_t bufferP3RegObj_f16[]; };
+layout(set = 0, binding = 1) readonly buffer P3_CLS_BUF_F32 { float bufferP3Cls_f32[]; };
+layout(set = 0, binding = 1) readonly buffer P3_CLS_BUF_F16 { float16_t bufferP3Cls_f16[]; };
+
+layout(set = 0, binding = 2) readonly buffer P4_REGOBJ_BUF_F32 { float bufferP4RegObj_f32[]; };
+layout(set = 0, binding = 2) readonly buffer P4_REGOBJ_BUF_F16 { float16_t bufferP4RegObj_f16[]; };
+layout(set = 0, binding = 3) readonly buffer P4_CLS_BUF_F32 { float bufferP4Cls_f32[]; };
+layout(set = 0, binding = 3) readonly buffer P4_CLS_BUF_F16 { float16_t bufferP4Cls_f16[]; };
+
+layout(set = 0, binding = 4) readonly buffer P5_REGOBJ_BUF_F32 { float bufferP5RegObj_f32[]; };
+layout(set = 0, binding = 4) readonly buffer P5_REGOBJ_BUF_F16 { float16_t bufferP5RegObj_f16[]; };
+layout(set = 0, binding = 5) readonly buffer P5_CLS_BUF_F32 { float bufferP5Cls_f32[]; };
+layout(set = 0, binding = 5) readonly buffer P5_CLS_BUF_F16 { float16_t bufferP5Cls_f16[]; };
+
+layout(set = 0, binding = 6) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 6) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+
+float sigmoid(float value)
+{
+    return 1.0 / (1.0 + exp(-value));
+}
+
+float readRegObj(uint scale, uint idx)
+{
+    if (typeI == 0u)
+    {
+        if (scale == 0u) return bufferP3RegObj_f32[idx];
+        if (scale == 1u) return bufferP4RegObj_f32[idx];
+        return bufferP5RegObj_f32[idx];
+    }
+    if (scale == 0u) return float(bufferP3RegObj_f16[idx]);
+    if (scale == 1u) return float(bufferP4RegObj_f16[idx]);
+    return float(bufferP5RegObj_f16[idx]);
+}
+
+float readCls(uint scale, uint idx)
+{
+    if (typeI == 0u)
+    {
+        if (scale == 0u) return bufferP3Cls_f32[idx];
+        if (scale == 1u) return bufferP4Cls_f32[idx];
+        return bufferP5Cls_f32[idx];
+    }
+    if (scale == 0u) return float(bufferP3Cls_f16[idx]);
+    if (scale == 1u) return float(bufferP4Cls_f16[idx]);
+    return float(bufferP5Cls_f16[idx]);
+}
+
+void writeO(uint idx, float value)
+{
+    if (typeO == 0u) bufferO_f32[idx] = value;
+    else bufferO_f16[idx] = float16_t(value);
+}
+
+void main()
+{
+    const uint channels = 5u + numClasses;
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= N * channels)
+        return;
+
+    const uint anchor = idx / channels;
+    const uint channel = idx - anchor * channels;
+
+    uint scale;
+    uint localAnchor;
+    uint gridSize;
+    uint scaleN;
+    if (anchor < p3N)
+    {
+        scale = 0u;
+        localAnchor = anchor;
+        gridSize = p3Size;
+        scaleN = p3N;
+    }
+    else if (anchor < p3N + p4N)
+    {
+        scale = 1u;
+        localAnchor = anchor - p3N;
+        gridSize = p4Size;
+        scaleN = p4N;
+    }
+    else
+    {
+        scale = 2u;
+        localAnchor = anchor - p3N - p4N;
+        gridSize = p5Size;
+        scaleN = p5N;
+    }
+
+    float raw;
+    if (channel < 5u)
+        raw = readRegObj(scale, channel * scaleN + localAnchor);
+    else
+        raw = readCls(scale, (channel - 5u) * scaleN + localAnchor);
+    const float stride = float(imageSize) / float(gridSize);
+    float value;
+    if (channel == 0u)
+        value = (raw + float(localAnchor % gridSize)) * stride;
+    else if (channel == 1u)
+        value = (raw + float(localAnchor / gridSize)) * stride;
+    else if (channel < 4u)
+        value = exp(raw) * stride;
+    else
+        value = sigmoid(raw);
+
+    writeO(idx, value);
+}

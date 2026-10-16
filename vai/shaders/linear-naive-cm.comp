@@ -1,0 +1,190 @@
+/*=============================================================================
+ linear-naive-cm.comp:  Linear / fully-connected layer (NT, cooperative matrix)
+     O[m, n] = epilogue( sum_k I[m, k] * W[n, k] + bias[n] )
+
+ Cooperative-matrix accelerated counterpart of vai-linear2.comp. Same NT
+ interface (W[N,K], bias[N], epilogue) so the host can swap shaders.
+ Handles arbitrary M by tiling rows into tM-row blocks.
+
+   * typeW applies to W and bias
+   * matrix inputs are always fp16 (fp32 storage is cast to fp16 before the
+     multiply); accumulator precision is accType (fp32 or fp16).
+
+ I and O are fp32; W and bias are uint[] params (READ_F via typeW). I is staged
+ straight into shared fp16 tiles (As), W via READ_F (Ws); the coopmat ops only
+ ever touch shared memory. The output is stored per-element along N (one
+ invocation per column) -> race-free, no alignment constraint.
+
+ Tile shape (tM, tN, tK), accType, and WG_SIZE are spec constants the host
+ queries from vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR.
+
+ Dispatch: vkCmdDispatch(ceil(N / (N_TILES*tN)), ceil(M / tM), 1).
+ Requirements: K % tK == 0; workgroup size == subgroup size == WG_SIZE.
+=============================================================================*/
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+#include "common/activation.h"
+#include "common/dtype_io.h"
+
+layout(constant_id = 0)  const uint typeW   = 0;   // 0: fp32, 1: fp16 — W and bias
+layout(constant_id = 1)  const uint hasBias = 1;   // 0: no bias,  1: bias[N]
+layout(constant_id = 2)  const uint tM      = 16;  // coopmat M (queried shape)
+layout(constant_id = 3)  const uint tN      = 8;   // coopmat N (queried shape)
+layout(constant_id = 4)  const uint tK      = 16;  // coopmat K (queried shape)
+layout(constant_id = 5)  const uint accType = 0;   // 0: fp32, 1: fp16 — accumulator
+layout(constant_id = 10) const uint WG_SIZE = 32;  // = subgroup size (queried)
+// epilogue spec constant lives at constant_id 100 (common/activation.h)
+
+layout(local_size_x_id = 10) in;   // workgroup x = WG_SIZE (one subgroup)
+
+const uint N_TILES = 4;             // N-tiles (accumulators) per workgroup
+const uint STRIDE  = N_TILES * tN;  // columns per workgroup / Cs & Ws row stride
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF    { float bufferO[];   };
+layout(set = 0, binding = 1) readonly  buffer I_BUF    { float bufferI[];   };
+layout(set = 0, binding = 2) readonly  buffer W_BUF    { uint bufferW[];    };
+layout(set = 0, binding = 3) readonly  buffer BIAS_BUF { uint bufferBias[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+};
+
+shared float16_t As[tM * tK];          // A tile  (tM x tK)
+shared float16_t Ws[tK * STRIDE];      // staged W tile (tK x STRIDE)
+shared float     Cs_f32[tM * STRIDE];  // accumulator store, accType == DTYPE_F32
+shared float16_t Cs_f16[tM * STRIDE];  // accumulator store, accType == DTYPE_F16
+
+#define matA      coopmat<float16_t, gl_ScopeSubgroup, tM, tK, gl_MatrixUseA>
+#define matB      coopmat<float16_t, gl_ScopeSubgroup, tK, tN, gl_MatrixUseB>
+#define accMatF32 coopmat<float,     gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+#define accMatF16 coopmat<float16_t, gl_ScopeSubgroup, tM, tN, gl_MatrixUseAccumulator>
+
+float readW(uint i)    { return READ_F(bufferW, i, typeW); }
+float readBias(uint n) { return (hasBias == 0u) ? 0.0 : READ_F(bufferBias, n, typeW); }
+
+// Stage A and W tiles into shared fp16. Out-of-range rows (>= M) / columns
+// (>= N) are zeroed. Caller issues the barrier.
+void stageInputs(uint k0, uint mBase, uint colBase)
+{
+    uint lid = gl_LocalInvocationID.x;
+    uint wg  = gl_WorkGroupSize.x;
+
+    // As[r*tK + k] = I[mBase + r][k0 + k]
+    for (uint idx = lid; idx < tM * tK; idx += wg)
+    {
+        uint r = idx / tK;
+        uint k = idx % tK;
+        uint m = mBase + r;
+        As[idx] = (m < M) ? float16_t(bufferI[m * K + k0 + k]) : float16_t(0.0);
+    }
+
+    // Ws[r*STRIDE + c] = W[colBase + c][k0 + r]   (transpose view of a W row-block)
+    for (uint idx = lid; idx < tK * STRIDE; idx += wg)
+    {
+        uint r = idx / STRIDE;
+        uint c = idx % STRIDE;
+        uint n = colBase + c;
+        Ws[idx] = (n < N) ? float16_t(readW(n * K + k0 + r)) : float16_t(0.0);
+    }
+}
+
+matA loadA()
+{
+    matA a;
+    coopMatLoad(a, As, 0, tK, gl_CooperativeMatrixLayoutRowMajor);
+    return a;
+}
+
+matB loadB(uint i)   // B tile i, from the staged shared W tile
+{
+    matB b;
+    coopMatLoad(b, Ws, i * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    return b;
+}
+
+// store the tM x STRIDE accumulator block to O (fp32, one column per invocation)
+void storeOut(uint mBase, uint colBase)
+{
+    uint lid = gl_LocalInvocationID.x;
+    uint wg  = gl_WorkGroupSize.x;
+
+    for (uint c = lid; c < STRIDE; c += wg)
+    {
+        uint col = colBase + c;
+        if (col >= N) continue;
+
+        float b = readBias(col);
+        for (uint r = 0u; r < tM; ++r)
+        {
+            uint m = mBase + r;
+            if (m >= M) break;
+            float acc = (accType == DTYPE_F32) ? Cs_f32[r * STRIDE + c] : float(Cs_f16[r * STRIDE + c]);
+            bufferO[m * N + col] = applyEpilogue(acc + b);
+        }
+    }
+}
+
+void main()
+{
+    uint mBase   = gl_WorkGroupID.y * tM;
+    uint colBase = gl_WorkGroupID.x * STRIDE;
+
+    // accType selects the accumulator coopmat type; the dead path is eliminated
+    // at specialization. Both paths share staging / A / B loads.
+    if (accType == DTYPE_F32)
+    {
+        accMatF32 acc0 = accMatF32(0.0);
+        accMatF32 acc1 = accMatF32(0.0);
+        accMatF32 acc2 = accMatF32(0.0);
+        accMatF32 acc3 = accMatF32(0.0);
+
+        for (uint k0 = 0u; k0 < K; k0 += tK)
+        {
+            stageInputs(k0, mBase, colBase);
+            barrier();
+            matA a = loadA();
+            acc0 = coopMatMulAdd(a, loadB(0u), acc0);
+            acc1 = coopMatMulAdd(a, loadB(1u), acc1);
+            acc2 = coopMatMulAdd(a, loadB(2u), acc2);
+            acc3 = coopMatMulAdd(a, loadB(3u), acc3);
+            barrier();
+        }
+
+        coopMatStore(acc0, Cs_f32, 0u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc1, Cs_f32, 1u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc2, Cs_f32, 2u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc3, Cs_f32, 3u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    else
+    {
+        accMatF16 acc0 = accMatF16(float16_t(0.0));
+        accMatF16 acc1 = accMatF16(float16_t(0.0));
+        accMatF16 acc2 = accMatF16(float16_t(0.0));
+        accMatF16 acc3 = accMatF16(float16_t(0.0));
+
+        for (uint k0 = 0u; k0 < K; k0 += tK)
+        {
+            stageInputs(k0, mBase, colBase);
+            barrier();
+            matA a = loadA();
+            acc0 = coopMatMulAdd(a, loadB(0u), acc0);
+            acc1 = coopMatMulAdd(a, loadB(1u), acc1);
+            acc2 = coopMatMulAdd(a, loadB(2u), acc2);
+            acc3 = coopMatMulAdd(a, loadB(3u), acc3);
+            barrier();
+        }
+
+        coopMatStore(acc0, Cs_f16, 0u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc1, Cs_f16, 1u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc2, Cs_f16, 2u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc3, Cs_f16, 3u * tN, STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    barrier();   // make the Cs writes visible before storeOut reads them
+    storeOut(mBase, colBase);
+}

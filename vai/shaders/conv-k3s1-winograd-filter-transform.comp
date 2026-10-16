@@ -1,0 +1,116 @@
+/*=============================================================================
+ Winograd F(4x4,3x3) filter transform.
+ Bindings: O=0, I=1. Dispatch covers pc.co*pc.ci.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/spec_constants.h"
+
+// Winograd filter transform family.
+// The transformed weights use the same storage type as the input weights.
+
+layout(local_size_x = 256) in;
+
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = 3) const bool reorder = false;
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly  buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+float readI(uint inputBase, uint offset)
+{
+    return typeW == DTYPE_F32
+        ? bufferI_f32[inputBase + offset]
+        : float(bufferI_f16[inputBase + offset]);
+}
+
+void writeO(uint index, float value)
+{
+    if (typeW == DTYPE_F32)
+    {
+        bufferO_f32[index] = value;
+    }
+    else
+    {
+        bufferO_f16[index] = float16_t(value);
+    }
+}
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.co * pc.ci) return;
+
+    uint co = index / pc.ci;
+    uint ci = index - co * pc.ci;
+    uint inputBase = (co * pc.ci + ci) * 9u;
+    uint transformBase = co * pc.ci + ci;
+    uint planeStride = pc.co * pc.ci;
+
+    float g[9];
+    for (uint i = 0u; i < 9u; ++i)
+        g[i] = readI(inputBase, i);
+
+    float t[18];
+    for (uint j = 0u; j < 3u; ++j)
+    {
+        float g0 = g[0u * 3u + j];
+        float g1 = g[1u * 3u + j];
+        float g2 = g[2u * 3u + j];
+        t[0u * 3u + j] = g0 * 0.25;
+        t[1u * 3u + j] = (-g0 - g1 - g2) / 6.0;
+        t[2u * 3u + j] = (-g0 + g1 - g2) / 6.0;
+        t[3u * 3u + j] = g0 / 24.0 + g1 / 12.0 + g2 / 6.0;
+        t[4u * 3u + j] = g0 / 24.0 - g1 / 12.0 + g2 / 6.0;
+        t[5u * 3u + j] = g2;
+    }
+
+    for (uint i = 0u; i < 6u; ++i)
+    {
+        float t0 = t[i * 3u + 0u];
+        float t1 = t[i * 3u + 1u];
+        float t2 = t[i * 3u + 2u];
+        float u[6];
+        u[0] = t0 * 0.25;
+        u[1] = (-t0 - t1 - t2) / 6.0;
+        u[2] = (-t0 + t1 - t2) / 6.0;
+        u[3] = t0 / 24.0 + t1 / 12.0 + t2 / 6.0;
+        u[4] = t0 / 24.0 - t1 / 12.0 + t2 / 6.0;
+        u[5] = t2;
+
+        for (uint j = 0u; j < 6u; ++j)
+        {
+            uint p = i * 6u + j;
+            uint outputIndex = p * planeStride + transformBase;
+            if (reorder)
+            {
+                const uint kTiles = pc.ci >> 4u;
+                const uint tile =
+                    ((p * (pc.co >> 4u) + (co >> 4u)) * kTiles +
+                     (ci >> 4u)) << 8u;
+                outputIndex =
+                    tile + (co & 15u) * 16u + (ci & 15u);
+            }
+            writeO(outputIndex, u[j]);
+        }
+    }
+}

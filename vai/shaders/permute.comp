@@ -1,0 +1,64 @@
+/*=============================================================================
+ permute.comp:
+     O[k] = I[ inputFlat(k) ]   (rank-N axis permutation, output-driven gather)
+
+ - I shape [D0 .. D(rank-1)]; O is the contiguous permuted tensor [E0 .. E(rank-1)].
+ - Gather (not scatter): each thread owns one OUTPUT element and pulls from the
+   input, so no atomics are needed.
+ - rank is a specialization constant, so the axis loop unrolls at pipeline build
+   and each rank gets its own straight-line index chain.
+ - O (typeO) and I (typeI) are fp32 or fp16, accessed through same-binding
+   buffer aliases. Dispatch (host): dispatch2(total).
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+layout(constant_id = 0) const uint rank = 3;                 // tensor rank
+
+layout(set = 0, binding = 0) buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant, std430) uniform PushConstants {
+    uint E[PERMUTE_MAX_RANK];   // output dims (contiguous: E[0] outer .. E[rank-1] inner)
+    uint IS[PERMUTE_MAX_RANK];  // input stride contributed by each output axis
+    uint total;         // output elements
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+// output element index -> input element index
+// Peels the output index from the inner axis outward; axis 0 needs no divide
+// because the remainder is already its coordinate.
+uint inputFlat(uint k)
+{
+    uint rem = k;
+    uint src = 0u;
+
+    [[unroll]] for (int i = int(rank) - 1; i >= 1; --i)
+    {
+        uint q = rem / E[i];
+        src += (rem - q * E[i]) * IS[i];   // (rem % E[i]) without a second divide
+        rem  = q;
+    }
+
+    return src + rem * IS[0];
+}
+
+void main()
+{
+    uint k = gl_GlobalInvocationID.x;      // one thread per output element
+    if (k >= total) return;
+
+    writeO(k, readI(inputFlat(k)));
+}

@@ -1,0 +1,356 @@
+/*=============================================================================
+ linear-tile.comp: tile (2D) output decomposition, shared-memory staged
+     (ported from the ggml/llama.cpp Vulkan mul_mm kernel)
+
+     O[m, n] = sum_k I[m, k] * W[n, k]
+
+     M = flattened batch, N = outDim, K = inDim
+     O [M, N], I [M, K], W [N, K] — each fp32 or fp16 via same-binding
+     buffer aliases; shared-memory / register-cache staging is fp16 and the
+     accumulator dtype is selected by accType, except that fp32 I and W
+     stage and accumulate in fp32 (stageF32).
+
+ One workgroup computes one wgM x wgN tile of O, marching over K in
+ wgK-wide blocks staged through shared memory. Inside the workgroup the
+ tile splits into subgroup tiles (sgM x sgN), each processed piece by
+ piece (sgpM x sgpN); every thread accumulates a tM x tN register tile
+ per piece.
+
+ Requirements:
+  - aligned == 1 (K and splitSize % wgK == 0): 8-wide loads; M / N tail rows
+    are zero-filled instead of read
+  - aligned == 0: scalar 2-element loads with row / K-tail masking and
+    zero fill
+ With robustBufferAccess == 0 neither path reads out of bounds. With 1 the
+ host enables per-pipeline robustness and the loaders' row-tail guards fold
+ away — robust OOB reads only feed rows / cols the stores mask off (the
+ K-tail masks stay: that axis is summed).
+
+ Split-K: workgroup z owns the K span [z * splitSize, min(K, (z + 1) *
+ splitSize)) and writes its partials to P[z, M, N] on binding 0;
+ linear-reduce.comp folds the partials and applies bias / epilogue.
+
+ Dispatch (host): (ceil(N / wgN), ceil(M / wgM), ceil(K / splitSize))
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0)  const uint wgSize   = 128;  // threads per workgroup (= local_size_x)
+layout(constant_id = 1)  const uint sgSize   = 32;   // lanes per subgroup tile (not forced on the pipeline)
+layout(constant_id = 2)  const uint wgM      = 64;   // workgroup tile size along M
+layout(constant_id = 3)  const uint wgN      = 64;   // workgroup tile size along N
+layout(constant_id = 4)  const uint wgK      = 32;   // k-block size
+layout(constant_id = 5)  const uint sgM      = 32;   // subgroup tile size along M
+layout(constant_id = 6)  const uint sgN      = 32;   // subgroup tile size along N
+layout(constant_id = 7)  const uint tM       = 4;    // thread tile size along M
+layout(constant_id = 8)  const uint tN       = 2;    // thread tile size along N (even: outputs are written in N-pairs)
+layout(constant_id = 9)  const uint sgpMIter = 2;    // pieces per subgroup tile along M (= sgM / sgpM)
+layout(constant_id = 10) const uint sgpNIter = 2;    // pieces per subgroup tile along N (= sgN / sgpN)
+layout(constant_id = 11) const uint accType  = 0;    // accumulator dtype (0: fp32, 1: fp16)
+layout(constant_id = 12) const uint robustBufferAccess  = 0;    // robust buffer access (0: disabled, 1: enabled)
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0;  // W (weight) dtype
+layout(constant_id = SPEC_ID_ALIGNED) const uint aligned = 1;  // 1: K % wgK == 0, 0: scalar masked loads
+
+const uint LOAD_VEC       = (aligned != 0u) ? 8u : 1u;   // elements per load (mat2x4 / f16mat2x4, or scalar)
+const uint LOAD_VEC_BATCH = (aligned != 0u) ? 1u : 2u;   // the scalar path loads 2 values per call
+const uint WGK_STEP     = 4;              // k elements consumed per inner step
+const uint SHMEM_STRIDE = wgK / 2 + 1;    // 2-element slots per shmem row; +1 avoids bank conflicts
+
+// fp32 staging when both operands are fp32 (the host then passes accType fp32).
+const uint stageF32 = (1u - typeI) * (1u - typeW);
+
+const float16_t FP16_MAX = 65504.0hf;     // largest finite fp16 value
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32  { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F16  { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_8F32 { mat2x4 bufferI_8f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_8F16 { f16mat2x4 bufferI_8f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer W_BUF_F32  { float bufferW_f32[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_F16  { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_8F32 { mat2x4 bufferW_8f32[]; };
+layout(set = 0, binding = 2) readonly buffer W_BUF_8F16 { f16mat2x4 bufferW_8f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint splitSize;   // K span per workgroup-z (= K without splitting)
+};
+
+f16mat2x4 readI8(uint i8) { return (typeI == DTYPE_F32) ? f16mat2x4(bufferI_8f32[i8]) : bufferI_8f16[i8]; }
+f16mat2x4 readW8(uint i8) { return (typeW == DTYPE_F32) ? f16mat2x4(bufferW_8f32[i8]) : bufferW_8f16[i8]; }
+float16_t readI(uint i)   { return (typeI == DTYPE_F32) ? float16_t(bufferI_f32[i]) : bufferI_f16[i]; }
+float16_t readW(uint i)   { return (typeW == DTYPE_F32) ? float16_t(bufferW_f32[i]) : bufferW_f16[i]; }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+void writeO(uint i, float16_t v) { if (typeO == DTYPE_F32) bufferO_f32[i] = float(v); else bufferO_f16[i] = v; }
+
+// One k-block of W rows (tileA) and I rows (tileB) in 2-element slots: fp16
+// (fp32 sources are rounded here) or, with stageF32, fp32. The unused set is one slot.
+shared f16vec2 tileA16[wgN * SHMEM_STRIDE * (1u - stageF32) + stageF32];
+shared f16vec2 tileB16[wgM * SHMEM_STRIDE * (1u - stageF32) + stageF32];
+shared vec2    tileA32[wgN * SHMEM_STRIDE * stageF32 + (1u - stageF32)];
+shared vec2    tileB32[wgM * SHMEM_STRIDE * stageF32 + (1u - stageF32)];
+
+void W_to_tileA(const uint pos_a, const uint row, const uint col, const uint idx_n, const uint block, const uint endK)
+{
+    const bool live = robustBufferAccess != 0 || idx_n < N;
+    if (aligned != 0u)
+    {
+        const uint idx     = pos_a + col * (K / LOAD_VEC) + row;
+        const uint buf_idx = col * SHMEM_STRIDE + row * (LOAD_VEC / 2);
+        if (stageF32 != 0u)
+        {
+            mat2x4 aa = live ? bufferW_8f32[idx] : mat2x4(0.0);
+            tileA32[buf_idx    ] = aa[0].xy;
+            tileA32[buf_idx + 1] = aa[0].zw;
+            tileA32[buf_idx + 2] = aa[1].xy;
+            tileA32[buf_idx + 3] = aa[1].zw;
+        }
+        else
+        {
+            f16mat2x4 aa = live ? readW8(idx) : f16mat2x4(0.0);
+            tileA16[buf_idx    ] = aa[0].xy;
+            tileA16[buf_idx + 1] = aa[0].zw;
+            tileA16[buf_idx + 2] = aa[1].xy;
+            tileA16[buf_idx + 3] = aa[1].zw;
+        }
+    }
+    else
+    {
+        const uint idx     = pos_a + col * K + row * 2;
+        const uint buf_idx = col * SHMEM_STRIDE + row;
+        const bool k0 = live && block + row * 2     < endK;
+        const bool k1 = live && block + row * 2 + 1 < endK;
+        if (stageF32 != 0u)
+            tileA32[buf_idx] = vec2(k0 ? bufferW_f32[idx] : 0.0, k1 ? bufferW_f32[idx + 1] : 0.0);
+        else
+            tileA16[buf_idx] = f16vec2(k0 ? readW(idx) : 0.0hf, k1 ? readW(idx + 1) : 0.0hf);
+    }
+}
+
+void I_to_tileB(const uint pos_b, const uint row, const uint col, const uint idx_m, const uint block, const uint endK)
+{
+    const bool live = robustBufferAccess != 0 || idx_m < M;
+    if (aligned != 0u)
+    {
+        const uint idx     = pos_b + col * (K / LOAD_VEC) + row;
+        const uint buf_idx = col * SHMEM_STRIDE + row * (LOAD_VEC / 2);
+        if (stageF32 != 0u)
+        {
+            mat2x4 bb = live ? bufferI_8f32[idx] : mat2x4(0.0);
+            tileB32[buf_idx    ] = bb[0].xy;
+            tileB32[buf_idx + 1] = bb[0].zw;
+            tileB32[buf_idx + 2] = bb[1].xy;
+            tileB32[buf_idx + 3] = bb[1].zw;
+        }
+        else
+        {
+            f16mat2x4 bb = live ? readI8(idx) : f16mat2x4(0.0);
+            tileB16[buf_idx    ] = bb[0].xy;
+            tileB16[buf_idx + 1] = bb[0].zw;
+            tileB16[buf_idx + 2] = bb[1].xy;
+            tileB16[buf_idx + 3] = bb[1].zw;
+        }
+    }
+    else
+    {
+        const uint idx     = pos_b + col * K + row * 2;
+        const uint buf_idx = col * SHMEM_STRIDE + row;
+        const bool k0 = live && block + row * 2     < endK;
+        const bool k1 = live && block + row * 2 + 1 < endK;
+        if (stageF32 != 0u)
+            tileB32[buf_idx] = vec2(k0 ? bufferI_f32[idx] : 0.0, k1 ? bufferI_f32[idx + 1] : 0.0);
+        else
+            tileB16[buf_idx] = f16vec2(k0 ? readI(idx) : 0.0hf, k1 ? readI(idx + 1) : 0.0hf);
+    }
+}
+
+void main()
+{
+    const uint nTile = gl_WorkGroupID.x;   // which wgN-wide slice of N this workgroup owns
+    const uint mTile = gl_WorkGroupID.y;   // which wgM-wide slice of M this workgroup owns
+
+    // Split-K: workgroup z accumulates only its own K span.
+    const uint startK = gl_WorkGroupID.z * splitSize;
+    const uint endK   = min(K, startK + splitSize);
+
+    // Cooperative loading: each thread copies one vec4 per row and the
+    // workgroup walks the rows loadstride at a time.
+    const uint loadr      = gl_LocalInvocationID.x % (wgK / LOAD_VEC / LOAD_VEC_BATCH);
+    const uint loadc      = gl_LocalInvocationID.x / (wgK / LOAD_VEC / LOAD_VEC_BATCH);
+    const uint loadstride = wgSize * LOAD_VEC * LOAD_VEC_BATCH / wgK;
+
+    uint pos_a = nTile * wgN * (K / LOAD_VEC) + startK / LOAD_VEC;   // read cursor into W (vec4 units)
+    uint pos_b = mTile * wgM * (K / LOAD_VEC) + startK / LOAD_VEC;   // read cursor into I (vec4 units)
+
+    // This thread's place in the hierarchy: workgroup -> subgroup -> piece -> thread.
+    const uint sgpM = sgM / sgpMIter;   // piece size along M
+    const uint sgpN = sgN / sgpNIter;   // piece size along N
+
+    const uint sgIdx = gl_LocalInvocationID.x / sgSize;   // subgroup index within the workgroup
+    const uint tis   = gl_LocalInvocationID.x % sgSize;   // thread index within the subgroup
+
+    const uint tisn = tis % (sgpN / tN);     // thread position in a piece, along N
+    const uint tism = tis / (sgpN / tN);     // thread position in a piece, along M
+
+    const uint sg_n = sgIdx % (wgN / sgN);   // subgroup position in the workgroup tile, along N
+    const uint sg_m = sgIdx / (wgN / sgN);   // subgroup position in the workgroup tile, along M
+
+    const uint a_row0 = sg_n * sgN + tisn * tN;   // this thread's first W row (within the workgroup tile)
+    const uint b_row0 = sg_m * sgM + tism * tM;   // this thread's first I row (within the workgroup tile)
+
+    // Both accumulator dtypes and both cache dtypes are declared; accType and
+    // stageF32 pick one each — the dead arrays vanish at ISA compilation.
+    vec2    sums_f32[sgpMIter * tM * sgpNIter * tN / 2];
+    f16vec2 sums_f16[sgpMIter * tM * sgpNIter * tN / 2];
+    f16vec4 cache_a16[sgpNIter * tN];               // this thread's W rows for one k-step
+    vec4    cache_a32[sgpNIter * tN];
+    f16vec4 cache_b16;                              // one I row for one k-step
+    vec4    cache_b32;
+
+    [[unroll]] for (uint i = 0; i < sgpMIter * tM * sgpNIter * tN / 2; i++)
+    {
+        if (accType == DTYPE_F32) sums_f32[i] = vec2(0.0f);
+        else               sums_f16[i] = f16vec2(0.0hf);
+    }
+
+    // Stage one k-block of W and I into shared memory, accumulate over it, repeat.
+    for (uint block = startK; block < endK; block += wgK)
+    {
+        [[unroll]] for (uint l = 0; l < wgN; l += loadstride)
+            W_to_tileA(pos_a, loadr, loadc + l, nTile * wgN + loadc + l, block, endK);
+
+        [[unroll]] for (uint l = 0; l < wgM; l += loadstride)
+            I_to_tileB(pos_b, loadr, loadc + l, mTile * wgM + loadc + l, block, endK);
+
+        barrier();
+
+        pos_a += wgK / LOAD_VEC;
+        pos_b += wgK / LOAD_VEC;
+
+        [[unroll]] for (uint i = 0; i < wgK / WGK_STEP; i++)
+        {
+            // Pull this thread's W rows for k-step i into registers.
+            [[unroll]] for (uint pn = 0; pn < sgpNIter; pn++)
+            {
+                [[unroll]] for (uint j = 0; j < tN; j++)
+                {
+                    const uint slot = (a_row0 + pn * sgpN + j) * SHMEM_STRIDE + 2 * i;
+                    if (stageF32 != 0u)
+                    {
+                        cache_a32[pn * tN + j].xy = tileA32[slot    ];
+                        cache_a32[pn * tN + j].zw = tileA32[slot + 1];
+                    }
+                    else
+                    {
+                        cache_a16[pn * tN + j].xy = tileA16[slot    ];
+                        cache_a16[pn * tN + j].zw = tileA16[slot + 1];
+                    }
+                }
+            }
+
+            // Multiply each of this thread's I rows against the cached W rows.
+            [[unroll]] for (uint pm = 0; pm < sgpMIter; pm++)
+            {
+                [[unroll]] for (uint cm = 0; cm < tM; cm++)
+                {
+                    const uint slot = (b_row0 + pm * sgpM + cm) * SHMEM_STRIDE + 2 * i;
+                    if (stageF32 != 0u)
+                    {
+                        cache_b32.xy = tileB32[slot    ];
+                        cache_b32.zw = tileB32[slot + 1];
+                    }
+                    else
+                    {
+                        cache_b16.xy = tileB16[slot    ];
+                        cache_b16.zw = tileB16[slot + 1];
+                    }
+
+                    [[unroll]] for (uint pn = 0; pn < sgpNIter; pn++)
+                    {
+                        [[unroll]] for (uint cn = 0; cn < tN / 2; cn++)
+                        {
+                            // sums layout: [sgpMIter][tM][sgpNIter][tN/2]
+                            const uint sums_idx = (pm * tM + cm) * sgpNIter * (tN / 2) + pn * (tN / 2) + cn;
+                            const uint ca = pn * tN + 2 * cn;
+                            if (stageF32 != 0u)
+                            {
+                                sums_f32[sums_idx].x = fma(cache_a32[ca    ].x, cache_b32.x, fma(cache_a32[ca    ].y, cache_b32.y,
+                                                       fma(cache_a32[ca    ].z, cache_b32.z, fma(cache_a32[ca    ].w, cache_b32.w, sums_f32[sums_idx].x))));
+                                sums_f32[sums_idx].y = fma(cache_a32[ca + 1].x, cache_b32.x, fma(cache_a32[ca + 1].y, cache_b32.y,
+                                                       fma(cache_a32[ca + 1].z, cache_b32.z, fma(cache_a32[ca + 1].w, cache_b32.w, sums_f32[sums_idx].y))));
+                            }
+                            else if (accType == DTYPE_F32)
+                            {
+                                sums_f32[sums_idx].x = fma(float(cache_a16[ca    ].x), float(cache_b16.x), fma(float(cache_a16[ca    ].y), float(cache_b16.y),
+                                                       fma(float(cache_a16[ca    ].z), float(cache_b16.z), fma(float(cache_a16[ca    ].w), float(cache_b16.w), sums_f32[sums_idx].x))));
+                                sums_f32[sums_idx].y = fma(float(cache_a16[ca + 1].x), float(cache_b16.x), fma(float(cache_a16[ca + 1].y), float(cache_b16.y),
+                                                       fma(float(cache_a16[ca + 1].z), float(cache_b16.z), fma(float(cache_a16[ca + 1].w), float(cache_b16.w), sums_f32[sums_idx].y))));
+                            }
+                            else
+                            {
+                                sums_f16[sums_idx].x = fma(cache_a16[ca    ].x, cache_b16.x, fma(cache_a16[ca    ].y, cache_b16.y,
+                                                       fma(cache_a16[ca    ].z, cache_b16.z, fma(cache_a16[ca    ].w, cache_b16.w, sums_f16[sums_idx].x))));
+                                sums_f16[sums_idx].y = fma(cache_a16[ca + 1].x, cache_b16.x, fma(cache_a16[ca + 1].y, cache_b16.y,
+                                                       fma(cache_a16[ca + 1].z, cache_b16.z, fma(cache_a16[ca + 1].w, cache_b16.w, sums_f16[sums_idx].y))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // fp16 accumulation can overflow; clamp so inf does not reach the output.
+    if (accType == DTYPE_F16)
+    {
+        [[unroll]] for (uint i = 0; i < sgpMIter * tM * sgpNIter * tN / 2; i++)
+            sums_f16[i] = clamp(sums_f16[i], -FP16_MAX, FP16_MAX);
+    }
+
+    // Store. O[m, n] lives at m * N + n; stores are masked against the
+    // M / N tails. Split-K stores its partials to P[z, M, N] instead.
+    const uint n0   = nTile * wgN + a_row0;   // this thread's first output, along N (global)
+    const uint m0   = mTile * wgM + b_row0;   // this thread's first output, along M (global)
+    const uint zOff = gl_WorkGroupID.z * M * N;
+
+    [[unroll]] for (uint pm = 0; pm < sgpMIter; pm++)
+    {
+        [[unroll]] for (uint pn = 0; pn < sgpNIter; pn++)
+        {
+            const uint m_sgp = m0 + pm * sgpM;
+            const uint n_sgp = n0 + pn * sgpN;
+            [[unroll]] for (uint cm = 0; cm < tM; cm++)
+            {
+                [[unroll]] for (uint cn = 0; cn < tN / 2; cn++)
+                {
+                    const uint sums_idx = (pm * tM + cm) * sgpNIter * (tN / 2) + pn * (tN / 2) + cn;
+                    const uint o_idx    = (m_sgp + cm) * N + n_sgp + 2 * cn;
+
+                    if (m_sgp + cm < M && n_sgp + 2 * cn < N)
+                        if (accType == DTYPE_F32)  writeO(zOff + o_idx, sums_f32[sums_idx].x);
+                        else                writeO(zOff + o_idx, sums_f16[sums_idx].x);
+
+                    if (m_sgp + cm < M && n_sgp + 2 * cn + 1 < N)
+                        if (accType == DTYPE_F32)  writeO(zOff + o_idx + 1, sums_f32[sums_idx].y);
+                        else                writeO(zOff + o_idx + 1, sums_f16[sums_idx].y);
+                }
+            }
+        }
+    }
+}

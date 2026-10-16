@@ -1,0 +1,770 @@
+/*=============================================================================
+ Unified non-CM K=3/S=2 implicit-GEMM convolution.
+ Independent specialization traits select the exact compile-time path instead
+ of encoding combinations of those traits in a numeric mode.
+ Bindings: O=0, I=1, W=2, BIAS=3, SCALE=4.
+ Dispatch: x=N tiles, y=Co tiles, z=split count.
+ Push constants: PushConstants.
+=============================================================================*/
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common/activation.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 1) const uint wgM = 64u;
+layout(constant_id = 2) const uint wgN = 64u;
+layout(constant_id = 3) const uint wgK = 8u;
+layout(constant_id = 4) const uint tM = 4u;
+layout(constant_id = 5) const bool alignM = false;
+layout(constant_id = 6) const uint splitK = 1u;
+layout(constant_id = 7) const bool alignN = false;
+layout(constant_id = 8) const bool alignK = false;
+// Keep accumulator arrays and their unrolled loops at a literal size of 8.
+// Specialization-constant array sizes or loop bounds regress NVIDIA codegen.
+layout(constant_id = SPEC_ID_TYPE_CI) const uint CI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_CO) const uint CO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HI) const uint HI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_HO) const uint HO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WI) const uint WI_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_WO) const uint WO_SPEC = 0u;
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0u;
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0u;
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0u;
+layout(constant_id = SPEC_ID_TYPE_P) const uint typeP = 0u;
+layout(constant_id = SPEC_ID_HAS_SCALE) const uint hasScale = 0u;
+layout(constant_id = SPEC_ID_HAS_BIAS) const uint hasBias = 1u;
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) readonly buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F32 { float bufferW_f32[]; };
+layout(set = 0, binding = 2) restrict readonly buffer W_BUF_F16 { float16_t bufferW_f16[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F32 { float bufferBias_f32[]; };
+layout(set = 0, binding = 3) restrict readonly buffer BIAS_BUF_F16 { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F32 { float bufferScale_f32[]; };
+layout(set = 0, binding = 4) restrict readonly buffer SCALE_BUF_F16 { float16_t bufferScale_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint hi;
+    uint wi;
+    uint ho;
+    uint wo;
+    uint ci;
+    uint co;
+    uint n;
+    uint splitCount;
+    uint kernel;
+    uint stride;
+} pc;
+
+const uint KERNEL_TAPS = 9u;
+
+const uint tN = 4u;
+const uint PAD_A = 4u;
+const uint A_STRIDE = wgM + PAD_A;
+const bool K_SPLIT = splitK > 1u;
+const bool FIRST_BK27 = wgK == 27u;
+const uint A_TILE_ELEMS = wgK * A_STRIDE;
+const uint B_TILE_ELEMS = wgK * wgN;
+const uint TILE_BUFFERS = K_SPLIT
+    ? 1u
+    : (typeW == DTYPE_F16 ? (FIRST_BK27 ? 1u : 2u) : 2u);
+const uint SPLIT_AS_ELEMS = 2u * A_TILE_ELEMS;
+const uint SPLIT_SHARED_ALLOC =
+    K_SPLIT && typeW == DTYPE_F32
+        ? SPLIT_AS_ELEMS + 2u * B_TILE_ELEMS
+        : 1u;
+const uint SPLIT_SHARED16_ALLOC =
+    K_SPLIT && typeW == DTYPE_F16
+        ? SPLIT_AS_ELEMS + 2u * B_TILE_ELEMS
+        : 1u;
+
+shared float As[typeW == DTYPE_F32 ? TILE_BUFFERS : 1u][A_TILE_ELEMS];
+shared float Bs[typeW == DTYPE_F32 ? TILE_BUFFERS : 1u][B_TILE_ELEMS];
+shared float16_t As16[typeW == DTYPE_F16 ? TILE_BUFFERS : 1u][A_TILE_ELEMS];
+shared float16_t Bs16[typeW == DTYPE_F16 ? TILE_BUFFERS : 1u][B_TILE_ELEMS];
+shared float SharedSplit[SPLIT_SHARED_ALLOC];
+shared float16_t SharedSplit16[SPLIT_SHARED16_ALLOC];
+
+float readI(uint i) { return typeI == DTYPE_F32 ? bufferI_f32[i] : float(bufferI_f16[i]); }
+float16_t readI16(uint i) { return typeI == DTYPE_F32 ? float16_t(bufferI_f32[i]) : bufferI_f16[i]; }
+float readBias(uint m)
+{
+    if (hasBias == 0u) return 0.0;
+    return typeP == DTYPE_F32 ? bufferBias_f32[m] : float(bufferBias_f16[m]);
+}
+float readScale(uint m) { return typeP == DTYPE_F32 ? bufferScale_f32[m] : float(bufferScale_f16[m]); }
+float readW(uint i) { return typeW == DTYPE_F32 ? bufferW_f32[i] : float(bufferW_f16[i]); }
+
+void writeO4(uint i, vec4 v) {
+    if (typeO == DTYPE_F32) bufferO_4f32[i] = v;
+    else bufferO_4f16[i] = f16vec4(v);
+}
+void writeO(uint i, float v) {
+    if (typeO == DTYPE_F32) bufferO_f32[i] = v;
+    else bufferO_f16[i] = float16_t(v);
+}
+
+uint splitAsIndex(uint buf, uint k, uint m)
+{
+    return buf * A_TILE_ELEMS + k * A_STRIDE + m;
+}
+
+uint splitBsIndex(uint buf, uint k, uint n)
+{
+    return SPLIT_AS_ELEMS + buf * B_TILE_ELEMS + k * wgN + n;
+}
+
+void writeShared(uint i, float v)
+{
+    if (typeW == DTYPE_F16)
+        SharedSplit16[i] = float16_t(v);
+    else
+        SharedSplit[i] = v;
+}
+
+float readShared(uint i)
+{
+    return typeW == DTYPE_F16
+        ? float(SharedSplit16[i])
+        : SharedSplit[i];
+}
+
+void writeTileA(uint buf, uint i, float v)
+{
+    if (typeW == DTYPE_F16)
+        As16[buf][i] = float16_t(v);
+    else
+        As[buf][i] = v;
+}
+
+void writeTileB(uint buf, uint i, float v)
+{
+    if (typeW == DTYPE_F16)
+        Bs16[buf][i] = float16_t(v);
+    else
+        Bs[buf][i] = v;
+}
+
+float readTileA(uint buf, uint i)
+{
+    return typeW == DTYPE_F16
+        ? float(As16[buf][i])
+        : As[buf][i];
+}
+
+float readTileB(uint buf, uint i)
+{
+    return typeW == DTYPE_F16
+        ? float(Bs16[buf][i])
+        : Bs[buf][i];
+}
+
+void decomposeK3(uint k, out uint c, out uint kh, out uint kw)
+{
+    c = k / 9u;
+    uint r = k % 9u;
+    kh = r / 3u;
+    kw = r % 3u;
+}
+
+
+float readConvInput32(uint k, uint hOut, uint wOut, uint Hi, uint Wi)
+{
+    uint c, kh, kw;
+    decomposeK3(k, c, kh, kw);
+
+    const uint hIn = hOut * 2u + kh - 1u;
+    const uint wIn = wOut * 2u + kw - 1u;
+    const bool valid = hIn < Hi && wIn < Wi;
+    const uint safeH = min(hIn, Hi - 1u);
+    const uint safeW = min(wIn, Wi - 1u);
+    const float value = readI((c * Hi + safeH) * Wi + safeW);
+    return valid ? value : 0.0;
+}
+
+float16_t readConvInput16(uint k, uint hOut, uint wOut, uint Hi, uint Wi)
+{
+    uint c, kh, kw;
+    decomposeK3(k, c, kh, kw);
+
+    int hIn = int(hOut * 2u) + (int(kh) - 1);
+    int wIn = int(wOut * 2u) + (int(kw) - 1);
+    if (hIn < 0 || hIn >= int(Hi) || wIn < 0 || wIn >= int(Wi))
+        return float16_t(0.0);
+    return readI16((c * Hi + uint(hIn)) * Wi + uint(wIn));
+}
+
+vec4 applyOutput(uint m, vec4 acc)
+{
+    vec4 value = hasScale == 0u
+        ? acc + vec4(readBias(m))
+        : fma(vec4(readScale(m)), acc, vec4(readBias(m)));
+    return applyEpilogue(value);
+}
+
+void writeOutputRow4(uint m, uint n0, uint N, vec4 v)
+{
+    if (!alignN && n0 >= N)
+        return;
+    uint base = m * N + n0;
+    vec4 value = applyOutput(m, v);
+    uint remaining = alignN ? 4u : N - n0;
+    if (alignN || (remaining >= 4u && (base & 3u) == 0u))
+    {
+        writeO4(base >> 2u, value);
+        return;
+    }
+    writeO(base, value.x);
+    if (remaining > 1u) writeO(base + 1u, value.y);
+    if (remaining > 2u) writeO(base + 2u, value.z);
+    if (remaining > 3u) writeO(base + 3u, value.w);
+}
+
+
+
+void main()
+{
+    uint Hi = HI_SPEC != 0u ? HI_SPEC : pc.hi;
+    uint Wi = WI_SPEC != 0u ? WI_SPEC : pc.wi;
+    uint Ho = HO_SPEC != 0u ? HO_SPEC : pc.ho;
+    uint Wo = WO_SPEC != 0u ? WO_SPEC : pc.wo;
+    uint Ci = CI_SPEC != 0u ? CI_SPEC : pc.ci;
+    uint Co = CO_SPEC != 0u ? CO_SPEC : pc.co;
+    uint N = Ho * Wo;
+    uint KK = Ci * KERNEL_TAPS;
+
+    // Wide-M path for fully tiled FP32 plans. Keep the established acc[8]
+    // paths below unchanged so their specialization codegen remains stable.
+    if (tM == 16u && typeW == DTYPE_F32 && alignM && alignN && alignK)
+    {
+        vec4 wideAcc[16];
+        [[unroll]]
+        for (uint tm = 0u; tm < 16u; ++tm)
+            wideAcc[tm] = vec4(0.0);
+
+        uint tileRow = gl_WorkGroupID.y;
+        uint tileCol = gl_WorkGroupID.x;
+        uint localId = gl_LocalInvocationID.x;
+        uint localSize = gl_WorkGroupSize.x;
+        uint threadN = localId % (wgN / tN);
+        uint threadM = localId / (wgN / tN);
+        uint innerColA = localId % wgK;
+        uint innerRowA = localId / wgK;
+        uint rowStrideA = localSize / wgK;
+        uint innerColB = localId % wgN;
+        uint innerRowB = localId / wgN;
+        uint rowStrideB = localSize / wgN;
+        uint mLoadBase = tileRow * wgM + innerRowA;
+        uint nLoadBase = tileCol * wgN + innerColB;
+        uint hOut = nLoadBase / Wo;
+        uint wOut = nLoadBase % Wo;
+
+        uint kTileCount = KK / wgK;
+        uint current = 0u;
+
+        {
+            uint k = innerColA;
+            for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+            {
+                uint m = mLoadBase + bm;
+                As[0][innerColA * A_STRIDE + innerRowA + bm] =
+                    readW(m * KK + k);
+            }
+            for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+            {
+                uint k2 = innerRowB + bk;
+                Bs[0][(innerRowB + bk) * wgN + innerColB] =
+                    readConvInput32(k2, hOut, wOut, Hi, Wi);
+            }
+        }
+        barrier();
+
+        for (uint ki = 0u; ki < kTileCount; ++ki)
+        {
+            uint next = 1u - current;
+            bool hasNextTile = ki + 1u < kTileCount;
+            if (hasNextTile)
+            {
+                uint k0next = (ki + 1u) * wgK;
+                uint k = k0next + innerColA;
+                for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+                {
+                    uint m = mLoadBase + bm;
+                    As[next][innerColA * A_STRIDE + innerRowA + bm] =
+                        readW(m * KK + k);
+                }
+                for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+                {
+                    uint k2 = k0next + innerRowB + bk;
+                    Bs[next][(innerRowB + bk) * wgN + innerColB] =
+                        readConvInput32(k2, hOut, wOut, Hi, Wi);
+                }
+            }
+
+            for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+            {
+                uint aBase = dotIdx * A_STRIDE + threadM * 16u;
+                uint bBase = dotIdx * wgN + threadN * tN;
+                vec4 inputVector = vec4(
+                    Bs[current][bBase],
+                    Bs[current][bBase + 1u],
+                    Bs[current][bBase + 2u],
+                    Bs[current][bBase + 3u]);
+
+                [[unroll]]
+                for (uint tm = 0u; tm < 16u; ++tm)
+                    wideAcc[tm] +=
+                        As[current][aBase + tm] * inputVector;
+            }
+
+            if (hasNextTile)
+            {
+                barrier();
+                current = next;
+            }
+        }
+
+        uint m0 = tileRow * wgM + threadM * 16u;
+        uint n0 = tileCol * wgN + threadN * tN;
+        [[unroll]]
+        for (uint tm = 0u; tm < 16u; ++tm)
+            writeOutputRow4(m0 + tm, n0, N, wideAcc[tm]);
+        return;
+    }
+
+    vec4 acc[8];
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+        if (tm < tM)
+            acc[tm] = vec4(0.0);
+
+    // FP16 first layer: a single wgK=27 tile.
+    if (FIRST_BK27)
+    {
+        uint t = gl_LocalInvocationID.x;
+        uint tileCol = gl_WorkGroupID.x;
+        bool rowAligned = (Wo % wgN) == 0u;
+        uint tilesPerRow = rowAligned ? Wo / wgN : 0u;
+        uint tileH = rowAligned ? tileCol / tilesPerRow : 0u;
+        uint tileX = rowAligned ? tileCol % tilesPerRow : 0u;
+        uint tileW = tileX * wgN;
+
+        for (uint index = t; index < wgK * wgM; index += gl_WorkGroupSize.x)
+        {
+            uint k = index / wgM;
+            uint m = index % wgM;
+            As16[0][k * A_STRIDE + m] = bufferW_f16[m * wgK + k];
+        }
+
+        for (uint index = t; index < wgK * wgN; index += gl_WorkGroupSize.x)
+        {
+            uint k = index / wgN;
+            uint nLocal = index % wgN;
+            uint n = tileCol * wgN + nLocal;
+            float16_t value = float16_t(0.0);
+            if (rowAligned)
+            {
+                value = readConvInput16(k, tileH, tileW + nLocal, Hi, Wi);
+            }
+            else if (n < N)
+            {
+                uint hOut = n / Wo;
+                uint wOut = n % Wo;
+                value = readConvInput16(k, hOut, wOut, Hi, Wi);
+            }
+            Bs16[0][k * wgN + nLocal] = value;
+        }
+        barrier();
+
+        uint threadN = t % (wgN / tN);
+        uint threadM = t / (wgN / tN);
+        uint m0 = threadM * tM;
+        uint n0 = tileCol * wgN + threadN * tN;
+
+        for (uint k = 0u; k < wgK; ++k)
+        {
+            uint bBase = k * wgN + threadN * tN;
+            vec4 inputVector = vec4(
+                float(Bs16[0][bBase]),
+                float(Bs16[0][bBase + 1u]),
+                float(Bs16[0][bBase + 2u]),
+                float(Bs16[0][bBase + 3u]));
+
+            uint aBase = k * A_STRIDE + m0;
+            [[unroll]]
+            for (uint tm = 0u; tm < 8u; ++tm)
+                if (tm < tM)
+                    acc[tm] +=
+                        float(As16[0][aBase + tm]) * inputVector;
+        }
+
+        [[unroll]]
+        for (uint tm = 0u; tm < 8u; ++tm)
+            if (tm < tM)
+            {
+                if (rowAligned)
+                {
+                    uint base = (m0 + tm) * N + n0;
+                    writeO4(base >> 2u, applyOutput(m0 + tm, acc[tm]));
+                }
+                else
+                {
+                    writeOutputRow4(m0 + tm, n0, N, acc[tm]);
+                }
+            }
+        return;
+    }
+
+    uint tileRow = gl_WorkGroupID.y;
+    uint tileCol = gl_WorkGroupID.x;
+    uint localId = gl_LocalInvocationID.x;
+    uint localSize = gl_WorkGroupSize.x;
+    uint threadN = localId % (wgN / tN);
+    uint threadM = localId / (wgN / tN);
+    uint innerColA = localId % wgK;
+    uint innerRowA = localId / wgK;
+    uint rowStrideA = localSize / wgK;
+    uint innerColB = localId % wgN;
+    uint innerRowB = localId / wgN;
+    uint rowStrideB = localSize / wgN;
+    uint mLoadBase = tileRow * wgM + innerRowA;
+    uint nLoadBase = tileCol * wgN + innerColB;
+
+    // Fully tiled FP32 path: no M/N/K tails and direct shared-memory access.
+    if (typeW == DTYPE_F32 && alignM && alignN && alignK)
+    {
+        uint hOut = nLoadBase / Wo;
+        uint wOut = nLoadBase % Wo;
+
+        uint kTileCount = KK / wgK;
+        uint current = 0u;
+
+        {
+            uint k = innerColA;
+            for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+            {
+                uint m = mLoadBase + bm;
+                As[0][innerColA * A_STRIDE + innerRowA + bm] =
+                    readW(m * KK + k);
+            }
+            for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+            {
+                uint k2 = innerRowB + bk;
+                Bs[0][(innerRowB + bk) * wgN + innerColB] =
+                    readConvInput32(
+                        k2, hOut, wOut, Hi, Wi);
+            }
+        }
+        barrier();
+
+        for (uint ki = 0u; ki < kTileCount; ++ki)
+        {
+            uint next = 1u - current;
+            bool hasNextTile = ki + 1u < kTileCount;
+            if (hasNextTile)
+            {
+                uint k0next = (ki + 1u) * wgK;
+                uint k = k0next + innerColA;
+                for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+                {
+                    uint m = mLoadBase + bm;
+                    As[next][
+                        innerColA * A_STRIDE + innerRowA + bm] =
+                        readW(m * KK + k);
+                }
+                for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+                {
+                    uint k2 = k0next + innerRowB + bk;
+                    Bs[next][
+                        (innerRowB + bk) * wgN + innerColB] =
+                        readConvInput32(
+                            k2, hOut, wOut, Hi, Wi);
+                }
+            }
+
+            for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+            {
+                uint aBase = dotIdx * A_STRIDE + threadM * tM;
+                uint bBase = dotIdx * wgN + threadN * tN;
+                vec4 inputVector = vec4(
+                    Bs[current][bBase],
+                    Bs[current][bBase + 1u],
+                    Bs[current][bBase + 2u],
+                    Bs[current][bBase + 3u]);
+
+                [[unroll]]
+                for (uint tm = 0u; tm < 8u; ++tm)
+                    if (tm < tM)
+                        acc[tm] +=
+                            As[current][aBase + tm] * inputVector;
+            }
+
+            if (hasNextTile)
+            {
+                barrier();
+                current = next;
+            }
+        }
+
+        uint m0 = tileRow * wgM + threadM * tM;
+        uint n0 = tileCol * wgN + threadN * tN;
+        [[unroll]]
+        for (uint tm = 0u; tm < 8u; ++tm)
+            if (tm < tM)
+                writeOutputRow4(m0 + tm, n0, N, acc[tm]);
+        return;
+    }
+
+    // K-split path: write FP32 partial sums without applying the epilogue.
+    if (K_SPLIT)
+    {
+        uint splitId = gl_WorkGroupID.z;
+        uint kPerSplit = (KK + splitK - 1u) / splitK;
+        uint kStart = splitId * kPerSplit;
+        uint kEnd = min(kStart + kPerSplit, KK);
+        uint kRange = kEnd - kStart;
+        uint hOut = (nLoadBase < N) ? nLoadBase / Wo : 0u;
+        uint wOut = (nLoadBase < N) ? nLoadBase - hOut * Wo : 0u;
+
+        uint kTileCount = (kRange + wgK - 1u) / wgK;
+        uint current = 0u;
+
+        {
+            uint k = kStart + innerColA;
+            for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+            {
+                uint m = mLoadBase + bm;
+                float aVal = 0.0;
+                if (m < Co && k < kEnd)
+                    aVal = readW(m * KK + k);
+                writeShared(
+                    splitAsIndex(0u, innerColA, innerRowA + bm),
+                    aVal);
+            }
+            for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+            {
+                uint k2 = kStart + innerRowB + bk;
+                uint n = nLoadBase;
+                float bVal = 0.0;
+                if (k2 < kEnd && n < N)
+                    bVal = readConvInput32(
+                        k2, hOut, wOut, Hi, Wi);
+                writeShared(
+                    splitBsIndex(0u, innerRowB + bk, innerColB),
+                    bVal);
+            }
+        }
+        barrier();
+
+        for (uint ki = 0u; ki < kTileCount; ++ki)
+        {
+            uint next = 1u - current;
+            bool hasNextTile = ki + 1u < kTileCount;
+            if (hasNextTile)
+            {
+                uint k0next = kStart + (ki + 1u) * wgK;
+                uint k = k0next + innerColA;
+                for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+                {
+                    uint m = mLoadBase + bm;
+                    float aVal = 0.0;
+                    if (m < Co && k < kEnd)
+                        aVal = readW(m * KK + k);
+                    writeShared(
+                        splitAsIndex(
+                            next, innerColA, innerRowA + bm),
+                        aVal);
+                }
+                for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+                {
+                    uint k2 = k0next + innerRowB + bk;
+                    uint n = nLoadBase;
+                    float bVal = 0.0;
+                    if (k2 < kEnd && n < N)
+                        bVal = readConvInput32(
+                            k2, hOut, wOut, Hi, Wi);
+                    writeShared(
+                        splitBsIndex(
+                            next, innerRowB + bk, innerColB),
+                        bVal);
+                }
+            }
+
+            for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+            {
+                uint aBase =
+                    splitAsIndex(current, dotIdx, threadM * tM);
+                uint bBase =
+                    splitBsIndex(current, dotIdx, threadN * tN);
+                vec4 inputVector = vec4(
+                    readShared(bBase),
+                    readShared(bBase + 1u),
+                    readShared(bBase + 2u),
+                    readShared(bBase + 3u));
+
+                [[unroll]]
+                for (uint tm = 0u; tm < 8u; ++tm)
+                    if (tm < tM)
+                        acc[tm] +=
+                            readShared(aBase + tm) * inputVector;
+            }
+
+            if (hasNextTile)
+            {
+                barrier();
+                current = next;
+            }
+        }
+
+        uint m0 = tileRow * wgM + threadM * tM;
+        uint n0 = tileCol * wgN + threadN * tN;
+        uint partialOffset = splitId * Co * N;
+
+        [[unroll]]
+        for (uint tm = 0u; tm < 8u; ++tm)
+        {
+            if (tm < tM)
+            {
+                uint m = m0 + tm;
+                if (m < Co)
+                {
+                    uint base = partialOffset + m * N + n0;
+                    if (n0 + 3u < N && (base & 3u) == 0u)
+                    {
+                        bufferO_4f32[base >> 2u] = acc[tm];
+                    }
+                    else
+                    {
+                        if (n0 < N) bufferO_f32[base] = acc[tm].x;
+                        if (n0 + 1u < N) bufferO_f32[base + 1u] = acc[tm].y;
+                        if (n0 + 2u < N) bufferO_f32[base + 2u] = acc[tm].z;
+                        if (n0 + 3u < N) bufferO_f32[base + 3u] = acc[tm].w;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Checked dtype-generic path.
+    uint hOut = (nLoadBase < N) ? nLoadBase / Wo : 0u;
+    uint wOut = (nLoadBase < N) ? nLoadBase - hOut * Wo : 0u;
+    uint kTileCount = alignK ? KK / wgK : (KK + wgK - 1u) / wgK;
+    uint current = 0u;
+
+    {
+        uint k = innerColA;
+        for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+        {
+            uint m = mLoadBase + bm;
+            float aVal = 0.0;
+            if ((alignM || m < Co) && (alignK || k < KK))
+                aVal = readW(m * KK + k);
+            writeTileA(
+                0u, innerColA * A_STRIDE + innerRowA + bm, aVal);
+        }
+        for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+        {
+            uint k2 = innerRowB + bk;
+            uint n = nLoadBase;
+            float bVal = 0.0;
+            if ((alignK || k2 < KK) && (alignN || n < N))
+                bVal = readConvInput32(k2, hOut, wOut, Hi, Wi);
+            writeTileB(0u, (innerRowB + bk) * wgN + innerColB, bVal);
+        }
+    }
+    barrier();
+
+    for (uint ki = 0u; ki < kTileCount; ++ki)
+    {
+        uint next = 1u - current;
+        bool hasNextTile = ki + 1u < kTileCount;
+        if (hasNextTile)
+        {
+            uint k0next = (ki + 1u) * wgK;
+            uint k = k0next + innerColA;
+            for (uint bm = 0u; bm < wgM; bm += rowStrideA)
+            {
+                uint m = mLoadBase + bm;
+                float aVal = 0.0;
+                if ((alignM || m < Co) && (alignK || k < KK))
+                    aVal = readW(m * KK + k);
+                writeTileA(
+                    next,
+                    innerColA * A_STRIDE + innerRowA + bm,
+                    aVal);
+            }
+            for (uint bk = 0u; bk < wgK; bk += rowStrideB)
+            {
+                uint k2 = k0next + innerRowB + bk;
+                uint n = nLoadBase;
+                float bVal = 0.0;
+                if ((alignK || k2 < KK) && (alignN || n < N))
+                    bVal = readConvInput32(
+                        k2, hOut, wOut, Hi, Wi);
+                writeTileB(
+                    next,
+                    (innerRowB + bk) * wgN + innerColB,
+                    bVal);
+            }
+        }
+
+        for (uint dotIdx = 0u; dotIdx < wgK; ++dotIdx)
+        {
+            uint aBase = dotIdx * A_STRIDE + threadM * tM;
+            uint bBase = dotIdx * wgN + threadN * tN;
+            vec4 inputVector = vec4(
+                readTileB(current, bBase),
+                readTileB(current, bBase + 1u),
+                readTileB(current, bBase + 2u),
+                readTileB(current, bBase + 3u));
+            [[unroll]]
+            for (uint tm = 0u; tm < 8u; ++tm)
+                if (tm < tM)
+                    acc[tm] +=
+                        readTileA(current, aBase + tm) * inputVector;
+        }
+
+        if (hasNextTile)
+        {
+            barrier();
+            current = next;
+        }
+    }
+
+    uint m0 = tileRow * wgM + threadM * tM;
+    uint n0 = tileCol * wgN + threadN * tN;
+    [[unroll]]
+    for (uint tm = 0u; tm < 8u; ++tm)
+    {
+        if (tm < tM)
+        {
+            uint m = m0 + tm;
+            if (alignM || m < Co)
+            {
+                uint base = m * N + n0;
+                vec4 v = applyOutput(m, acc[tm]);
+                if ((alignN || n0 + 3u < N) && (base & 3u) == 0u)
+                {
+                    writeO4(base >> 2u, v);
+                }
+                else
+                {
+                    if (n0 < N) writeO(base, v.x);
+                    if (n0 + 1u < N) writeO(base + 1u, v.y);
+                    if (n0 + 2u < N) writeO(base + 2u, v.z);
+                    if (n0 + 3u < N) writeO(base + 3u, v.w);
+                }
+            }
+        }
+    }
+}

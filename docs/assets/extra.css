@@ -1,0 +1,488 @@
+/* ===============================================================
+   vAiStrata 디자인 시스템을 Material 테마에 얹는다.
+
+   정본은 website/DESIGN.md 다. 이 파일은 그 문서의 토큰을 Material 의
+   --md-* 변수로 옮기는 얇은 매핑 계층이고, 색·크기를 여기서 새로 정하지
+   않는다. 값을 바꿔야 하면 DESIGN.md 를 먼저 고친다.
+
+   문서 사이트에만 걸리는 결정(우측 목차 제거, 본문 폭 제한)은 맨 아래
+   「문서 사이트 고유」 절에 모아 둔다.
+   =============================================================== */
+
+/* --- Archivo, self-hosted ---------------------------------------
+   website/public/fonts 에서 그대로 복사한 가변 폰트 두 벌(400~600).
+   Google CDN 을 쓰지 않는 것은 website 의 결정을 따른 것이고, 여기서는
+   폰트가 저장소 안에 있어 빌드와 열람이 외부 요청 없이 끝난다.
+   Archivo 에는 한글이 없어 한글은 스택 뒤쪽 Malgun Gothic 이 그린다.
+   ---------------------------------------------------------------- */
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 400 600;
+  font-stretch: 100%;
+  font-display: swap;
+  src: url("fonts/archivo-var-latin-ext.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Archivo";
+  font-style: normal;
+  font-weight: 400 600;
+  font-stretch: 100%;
+  font-display: swap;
+  src: url("fonts/archivo-var-latin.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* --- 브랜드 토큰 ------------------------------------------------
+   DESIGN.md 의 colors 블록 그대로. 한 색상(3~12도)에 채도 두 단계다.
+   ---------------------------------------------------------------- */
+:root {
+  --canvas: #0e0d0d;
+  --surface: #161514;
+  --surface-raised: #201e1d;
+  --surface-brand: #221412;
+
+  --hairline: #302d2d;
+  --hairline-strong: #403c3b;
+  --hairline-brand: #441f1a;
+
+  --text: #ede7e4;
+  --body: #bfb7b4;
+  --muted: #948c8a;
+  --faint: #6b6462; /* 3.4:1 — 글리프·비활성 전용, 문장에 쓰지 않는다 */
+
+  --primary: #9d3c30; /* 인쇄된 브랜드색. 채움 전용 (캔버스 위 2.9:1) */
+  --primary-deep: #803128;
+  --on-primary: #ffffff;
+  --ember: #db6253; /* 같은 색상을 명도만 올린 잉크형. 글자·선 (5.4:1) */
+  --ember-soft: #f58476;
+
+  --semantic-success: #4fae7f;
+  --semantic-warning: #d9a441;
+  --semantic-error: #e5484d;
+
+  --font-sans: "Archivo", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    Roboto, "Helvetica Neue", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* --- 토큰 → Material 변수 --------------------------------------
+   mkdocs.yml 은 scheme: slate 하나만 둔다. DESIGN.md 에 라이트 팔레트가
+   없어서(Known Gaps — ember 는 흰 바탕에서 2.9:1) 라이트 스킴을 만들지
+   않고 토글도 두지 않는다. 필요해지면 DESIGN.md 에서 먼저 결정한다.
+
+   --md-hue 는 안전망이다. 여기서 덮지 못한 slate 의 hsla() 파생값이
+   기본값(청흑)으로 남지 않고 웜 계열로 떨어지게 한다.
+   ---------------------------------------------------------------- */
+[data-md-color-scheme="slate"] {
+  --md-hue: 12;
+
+  --md-text-font-family: var(--font-sans);
+  --md-code-font-family: var(--font-mono);
+
+  --md-default-bg-color: var(--canvas);
+  --md-default-bg-color--light: rgba(14, 13, 13, 0.54);
+  --md-default-bg-color--lighter: rgba(14, 13, 13, 0.26);
+  --md-default-bg-color--lightest: rgba(14, 13, 13, 0.07);
+
+  --md-default-fg-color: var(--text);
+  --md-default-fg-color--light: var(--body);
+  --md-default-fg-color--lighter: var(--muted);
+  --md-default-fg-color--lightest: var(--hairline);
+
+  /* 상단바는 캔버스다 — nav-bar 규격이 "헤더가 브랜드색을 쓰는 곳은
+     현재 페이지 표시 한 군데뿐"이라고 못박는다. */
+  --md-primary-fg-color: var(--canvas);
+  --md-primary-fg-color--light: var(--surface);
+  --md-primary-fg-color--dark: var(--canvas);
+  --md-primary-bg-color: var(--text);
+  --md-primary-bg-color--light: var(--muted);
+
+  --md-accent-fg-color: var(--ember-soft);
+  --md-accent-fg-color--transparent: rgba(219, 98, 83, 0.1);
+  --md-accent-bg-color: var(--on-primary);
+  --md-accent-bg-color--light: var(--text);
+
+  --md-typeset-color: var(--body);
+  --md-typeset-a-color: var(--ember);
+  --md-typeset-mark-color: rgba(157, 60, 48, 0.3);
+  --md-typeset-del-color: rgba(229, 72, 77, 0.15);
+  --md-typeset-ins-color: rgba(79, 174, 127, 0.15);
+  --md-typeset-kbd-color: var(--surface-raised);
+  --md-typeset-kbd-accent-color: var(--hairline-strong);
+  --md-typeset-kbd-border-color: var(--hairline);
+  --md-typeset-table-color: var(--hairline-brand);
+
+  --md-code-bg-color: var(--surface);
+  --md-code-fg-color: var(--body);
+
+  /* hl_lines 로 강조한 줄. 테마 기본값은 파란색(#2977ff)이라 단일 색상 체계에서
+     유일하게 튀는 곳이었다. 배경은 primary 틴트, 왼쪽 2px 막대는 ember —
+     "강조는 채움과 선의 색으로 말한다" 는 규격 그대로다. */
+  --md-code-hl-color: var(--ember);
+  --md-code-hl-color--light: rgba(157, 60, 48, 0.22);
+
+  --md-admonition-bg-color: var(--surface);
+  --md-admonition-fg-color: var(--body);
+
+  --md-footer-bg-color: var(--canvas);
+  --md-footer-bg-color--dark: var(--canvas);
+  --md-footer-fg-color: var(--text);
+  --md-footer-fg-color--light: var(--muted);
+  --md-footer-fg-color--lighter: var(--faint);
+
+  /* 그림자 없음. 깊이는 1px 헤어라인과 채움 한 단계로만 표현한다. */
+  --md-shadow-z1: none;
+  --md-shadow-z2: none;
+  --md-shadow-z3: none;
+}
+
+/* --- 상단바 ----------------------------------------------------- */
+.md-header {
+  background-color: rgba(14, 13, 13, 0.88);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--hairline);
+  box-shadow: none;
+}
+.md-header--shadow {
+  box-shadow: none;
+}
+.md-header__title {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.md-header__topic:first-child {
+  color: var(--text);
+}
+
+/* 헤더 우측 언어 선택기. 테마 기본 드롭다운은 그림자로 떠 있는데 이 시스템에
+   그림자가 없으므로(--md-shadow-z2: none) 경계를 헤어라인으로 그린다. */
+.md-select__inner {
+  background-color: var(--surface-raised);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 6px;
+  box-shadow: none;
+}
+.md-select__inner::after {
+  border-bottom-color: var(--hairline-strong);
+}
+.md-select__link {
+  color: var(--body);
+  transition: color 0.15s;
+}
+.md-select__link:is(:hover, :focus) {
+  color: var(--ember);
+}
+
+/* 검색 입력은 code-block 과 같은 6px hairline 사각형이다. */
+.md-search__form {
+  background-color: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+.md-search__form:hover,
+[data-md-toggle="search"]:checked ~ .md-header .md-search__form {
+  background-color: var(--surface-raised);
+  border-color: var(--hairline-strong);
+}
+.md-search__input::placeholder {
+  color: var(--muted);
+}
+.md-search__output {
+  border-radius: 6px;
+}
+.md-search-result__meta {
+  background-color: var(--surface);
+  color: var(--muted);
+}
+.md-search-result__article--document .md-search-result__title {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* --- 좌측 네비게이션 --------------------------------------------
+   현재 페이지만 브랜드색(ember)으로 표시하고 나머지는 명도로 가른다.
+   ---------------------------------------------------------------- */
+.md-nav {
+  font-size: 0.7rem;
+}
+.md-nav__title {
+  color: var(--muted);
+  font-weight: 600;
+}
+.md-nav__link {
+  color: var(--body);
+  transition: color 0.15s;
+}
+.md-nav__link:is(:hover, :focus) {
+  color: var(--text);
+}
+.md-nav__link--active,
+.md-nav__item--active > .md-nav__link,
+.md-nav__link--active:is(:hover, :focus) {
+  color: var(--ember);
+}
+/* 최상위 항목 사이에는 선을 넣지 않는다 — 다 같은 종류의 장이고, 선은
+   "다른 종류" 를 말할 때만 쓴다. 사이드바와 본문 사이만 헤어라인으로 가른다. */
+.md-sidebar--primary {
+  border-right: 1px solid var(--hairline);
+}
+
+/* --- 본문 타이포그래피 ------------------------------------------
+   굵기는 3단(600 제목 / 500 버튼 / 400 나머지)이고 이탤릭은 없다.
+   자간은 세 제목 단계 모두 -0.02em 으로 같다.
+   ---------------------------------------------------------------- */
+.md-typeset {
+  font-size: 0.85rem; /* body-md 17px */
+  line-height: 1.65;
+}
+
+/* 문서 제목은 아래 선, 절 제목은 위 선 — 선은 "다른 종류의 것이
+   시작된다"를 말한다. 같은 종류의 인접은 여백으로만 가르므로 h3 는 선이
+   없다(테마 기본값은 h1·h2 를 본문보다 얇고 흐리게 그려서 큰 제목일수록
+   덜 보이는데, 여기서는 굵기 600 과 --text 색이 그 위계를 세운다). */
+.md-typeset h1 {
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: clamp(1.9rem, 4vw, 2.4rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  border-bottom: 1px solid var(--hairline-strong);
+  padding-bottom: 0.3em;
+  margin-bottom: 1.2em;
+}
+.md-typeset h2 {
+  color: var(--text);
+  font-size: 1.55rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  border-top: 1px solid var(--hairline);
+  padding-top: 1.2em;
+  margin-top: 2.6em;
+}
+.md-typeset h3 {
+  color: var(--text);
+  font-size: 1rem; /* heading-md 20px */
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  margin-top: 1.8em;
+}
+.md-typeset :is(h4, h5, h6) {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  text-transform: none; /* h5 를 대문자로 바꾸는 테마 기본값을 끈다 */
+}
+
+/* 강조는 색으로도 가른다 — body 위의 text 한 단계. */
+.md-typeset strong {
+  color: var(--text);
+  font-weight: 600;
+}
+/* 이탤릭은 쓰지 않는다. 문서에서 이 표기는 캡션으로 쓰이고 있어
+   굵기가 아니라 캡션 색(muted)으로 내린다 — 600 으로 올리면 strong 과
+   구분되지 않는다. */
+.md-typeset em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.md-typeset a {
+  transition: color 0.15s;
+}
+.md-typeset a:is(:hover, :focus) {
+  color: var(--ember-soft);
+}
+.md-typeset .headerlink {
+  color: var(--faint);
+}
+.md-typeset blockquote {
+  border-left: 1px solid var(--hairline-strong);
+  color: var(--muted);
+}
+.md-typeset hr {
+  border-bottom: 1px solid var(--hairline);
+}
+
+/* --- 코드 ------------------------------------------------------- */
+.md-typeset code {
+  background-color: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 3px; /* 인라인 코드는 tag 급이다 */
+  color: var(--body);
+  font-size: 0.75rem; /* code 15px */
+}
+.md-typeset pre > code {
+  border-radius: 6px;
+}
+.md-typeset :is(.highlight, .highlighttable) {
+  border-radius: 6px;
+}
+.md-typeset .highlighttable .linenos {
+  background-color: var(--surface);
+  border-right: 1px solid var(--hairline);
+}
+.md-typeset .linenos .linenodiv pre {
+  color: var(--muted);
+}
+.md-typeset .highlight span.filename {
+  background-color: var(--surface-raised);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+.md-clipboard {
+  color: var(--faint);
+}
+.md-clipboard:is(:hover, :focus) {
+  color: var(--ember);
+}
+
+/* --- 표 --------------------------------------------------------
+   헤더는 라벨색(ember)을, 강조 행은 채움을 가져간다 — 둘 다 칠하면
+   서로를 지운다. 셀 경계는 hairline-brand 로, 캔버스 대비 휘도는
+   hairline 과 같으면서 색만 따뜻해진다.
+   ---------------------------------------------------------------- */
+.md-typeset table:not([class]) {
+  border: 1px solid var(--hairline-brand);
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: 0.75rem; /* body-sm 15px */
+}
+.md-typeset table:not([class]) th {
+  background-color: var(--surface-raised);
+  color: var(--ember);
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 400;
+  letter-spacing: 0.06em;
+  /* 대문자 변환은 하지 않는다 — 헤더에 vAi 가 들어가면 VAI 가 된다. */
+}
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--hairline-brand);
+}
+.md-typeset table:not([class]) tbody tr:hover {
+  background-color: var(--surface);
+  box-shadow: none;
+}
+.md-typeset table:not([class]) code {
+  background-color: var(--canvas);
+}
+
+/* --- 강조 박스 (admonition / details) --------------------------
+   레벨 2 는 "테두리 색이 바뀐다"이고 들리는 게 아니다 — 왼쪽 굵은 띠와
+   제목 배경 틴트를 없애고 1px 테두리 색으로만 종류를 말한다.
+   위험 계열은 색만으로 뜻을 나르지 못한다(브랜드가 빨강을 쓴다) —
+   테마가 항상 제목 문구를 함께 그리는 것에 의존한다.
+   ---------------------------------------------------------------- */
+.md-typeset :is(.admonition, details) {
+  background-color: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  box-shadow: none;
+  font-size: 0.75rem;
+}
+.md-typeset :is(.admonition-title, summary) {
+  background-color: transparent;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text);
+  font-weight: 600;
+}
+.md-typeset :is(.note, .info, .todo, .abstract, .summary, .tldr) {
+  border-color: var(--hairline-brand);
+}
+.md-typeset
+  :is(.note, .info, .todo, .abstract, .summary, .tldr)
+  > :is(.admonition-title, summary)::before {
+  background-color: var(--ember);
+}
+.md-typeset
+  :is(.tip, .hint, .important, .success, .check, .done)
+  > :is(.admonition-title, summary)::before {
+  background-color: var(--semantic-success);
+}
+.md-typeset
+  :is(.warning, .caution, .attention, .question, .help, .faq)
+  > :is(.admonition-title, summary)::before {
+  background-color: var(--semantic-warning);
+}
+.md-typeset
+  :is(.danger, .error, .failure, .fail, .missing, .bug)
+  > :is(.admonition-title, summary)::before {
+  background-color: var(--semantic-error);
+}
+
+/* --- 버튼 ------------------------------------------------------
+   button-outline: 테두리·글자는 ember, 호버는 밝아지는 게 아니라 채워진다.
+   ---------------------------------------------------------------- */
+.md-typeset .md-button {
+  background-color: transparent;
+  border: 1px solid var(--ember);
+  border-radius: 6px;
+  color: var(--ember);
+  font-weight: 500;
+  transition: background-color 0.15s, color 0.15s;
+}
+.md-typeset .md-button:is(:hover, :focus) {
+  background-color: var(--primary);
+  border-color: var(--ember);
+  color: var(--on-primary);
+}
+.md-typeset .md-button--primary {
+  background-color: var(--primary);
+  border-color: var(--primary);
+  color: var(--on-primary);
+}
+.md-typeset .md-button--primary:is(:hover, :focus) {
+  background-color: var(--primary-deep);
+  border-color: var(--primary-deep);
+  color: var(--on-primary);
+}
+
+/* --- 하단 / 페이지 이동 ----------------------------------------- */
+.md-footer {
+  border-top: 1px solid var(--hairline);
+}
+.md-footer-meta {
+  background-color: var(--canvas);
+  border-top: 1px solid var(--hairline);
+}
+.md-footer__link:is(:hover, :focus) {
+  color: var(--ember);
+  opacity: 1;
+}
+.md-footer__direction,
+.md-copyright {
+  color: var(--muted);
+}
+
+/* --- 모션 ------------------------------------------------------
+   상호작용 요소의 background·border-color 0.15s 뿐이다.
+   ---------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
+
+/* ===============================================================
+   문서 사이트 고유 — DESIGN.md 가 다루지 않는 결정
+   =============================================================== */
+
+/* 우측 페이지 내 목차를 쓰지 않는다 — 좌측 nav 하나로 충분하다. */
+.md-sidebar.md-sidebar--secondary {
+  display: none !important;
+}
+
+/* 목차를 뺀 만큼 본문이 넓어져 한 줄이 지나치게 길어진다. 폭을 제한하되
+   가운데로 모으지 않는다 — 전부 왼쪽 정렬이다. */
+.md-content__inner {
+  margin-right: auto;
+  max-width: 56rem;
+}

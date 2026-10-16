@@ -1,0 +1,117 @@
+/*=============================================================================
+ linear-reduce.comp: split-K reduce for linear-tile, with the bias /
+     activation epilogue fused in
+     (ported from the ggml/llama.cpp Vulkan mul_mat_split_k_reduce kernel)
+
+     O[m, n] = s * epilogue( sum_z P[z, m, n] + B[m, n] ) + R[m, n]    residualOrder 0
+     O[m, n] = s * epilogue( sum_z P[z, m, n] + B[m, n] + R[m, n] )    residualOrder 1
+
+     P [splitCount, M, N] partial sums and O [M, N] are typeO. The bias B
+     (typeW) is [N] or [M, N]; the residual R (typeO)
+     is [M, N]. A [M, N] operand may be shorter rows that repeat over M
+     (biasElems / residualElems). Each invocation folds four consecutive
+     elements; the vec4 path needs the four in bounds and in one row of every
+     operand — otherwise the scalar loop covers them.
+
+ Dispatch (host): (ceil(MN / (256 * 4)), 1, 1)
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#include "common/activation.h"
+#include "common/spec_constants.h"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint hasBias = 0;        // 1: bias[N] or bias[M, N]
+layout(constant_id = 1) const uint biasElems = 0;      // 0 covers O; else the bias block repeats
+layout(constant_id = 2) const uint hasResidual = 0;    // 1: residual[M, N]
+layout(constant_id = 3) const uint residualElems = 0;  // 0: the residual covers O; else it repeats
+layout(constant_id = 4) const uint residualOrder = 0;  // 0: after the epilogue, 1: before it
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O, P and residual dtype
+layout(constant_id = SPEC_ID_TYPE_W) const uint typeW = 0;  // bias dtype
+
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32  { float bufferO_f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16  { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer P_BUF_F32  { float bufferP_f32[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF_F16  { float16_t bufferP_f16[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF_4F32 { vec4 bufferP_4f32[]; };
+layout(set = 0, binding = 1) readonly buffer P_BUF_4F16 { f16vec4 bufferP_4f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer BIAS_BUF_F32  { float bufferBias_f32[]; };
+layout(set = 0, binding = 2) readonly buffer BIAS_BUF_F16  { float16_t bufferBias_f16[]; };
+layout(set = 0, binding = 2) readonly buffer BIAS_BUF_4F32 { vec4 bufferBias_4f32[]; };
+layout(set = 0, binding = 2) readonly buffer BIAS_BUF_4F16 { f16vec4 bufferBias_4f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 3) readonly buffer R_BUF_F32  { float bufferR_f32[]; };
+layout(set = 0, binding = 3) readonly buffer R_BUF_F16  { float16_t bufferR_f16[]; };
+layout(set = 0, binding = 3) readonly buffer R_BUF_4F32 { vec4 bufferR_4f32[]; };
+layout(set = 0, binding = 3) readonly buffer R_BUF_4F16 { f16vec4 bufferR_4f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint MN;             // M * N
+    uint splitCount;     // number of K splits (z extent of P)
+    uint N;
+    float scalarScale;   // s
+};
+
+float readP(uint i)      { return (typeO == DTYPE_F32) ? bufferP_f32[i] : float(bufferP_f16[i]); }
+vec4  readP4(uint i4)    { return (typeO == DTYPE_F32) ? bufferP_4f32[i4] : vec4(bufferP_4f16[i4]); }
+// Each operand's element for output index i (row-major over [M, N]).
+uint biasIdx(uint i)     { return (biasElems == 0u) ? i : i % biasElems; }
+uint residualIdx(uint i) { return (residualElems == 0u) ? i : i % residualElems; }
+
+float readBias(uint i)   { return (hasBias == 0u) ? 0.0 : ((typeW == DTYPE_F32) ? bufferBias_f32[biasIdx(i)] : float(bufferBias_f16[biasIdx(i)])); }
+vec4  readBias4(uint i)  { return (hasBias == 0u) ? vec4(0.0) : ((typeW == DTYPE_F32) ? bufferBias_4f32[biasIdx(i) / 4] : vec4(bufferBias_4f16[biasIdx(i) / 4])); }
+float readR(uint i)      { return (hasResidual == 0u) ? 0.0 : ((typeO == DTYPE_F32) ? bufferR_f32[residualIdx(i)] : float(bufferR_f16[residualIdx(i)])); }
+vec4  readR4(uint i)     { return (hasResidual == 0u) ? vec4(0.0) : ((typeO == DTYPE_F32) ? bufferR_4f32[residualIdx(i) / 4] : vec4(bufferR_4f16[residualIdx(i) / 4])); }
+void writeO(uint i, float v)   { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+void writeO4(uint i4, vec4 v)  { if (typeO == DTYPE_F32) bufferO_4f32[i4] = v; else bufferO_4f16[i4] = f16vec4(v); }
+
+vec4 applyEpilogue4(vec4 v)
+{
+    return vec4(applyEpilogue(v.x), applyEpilogue(v.y), applyEpilogue(v.z), applyEpilogue(v.w));
+}
+
+void main()
+{
+    // Each invocation folds four consecutive elements.
+    const uint idx = gl_GlobalInvocationID.x * 4;
+
+    if (idx >= MN)
+        return;
+
+    if (idx + 3 < MN && MN % 4 == 0
+        && biasElems % 4 == 0 && residualElems % 4 == 0)
+    {
+        vec4 result = readBias4(idx);
+
+        [[unroll]] for (uint i = 0; i < splitCount; i++)
+            result += readP4((i * MN + idx) / 4);
+
+        const vec4 r = readR4(idx);
+        writeO4(idx / 4, (residualOrder == 1u) ? scalarScale * applyEpilogue4(result + r)
+                                               : scalarScale * applyEpilogue4(result) + r);
+    }
+    else
+    {
+        [[unroll]] for (uint j = 0; j < 4; ++j)
+        {
+            if (idx + j < MN)
+            {
+                float result = readBias(idx + j);
+
+                [[unroll]] for (uint i = 0; i < splitCount; i++)
+                    result += readP(i * MN + idx + j);
+
+                const float r = readR(idx + j);
+                writeO(idx + j, (residualOrder == 1u) ? scalarScale * applyEpilogue(result + r)
+                                                      : scalarScale * applyEpilogue(result) + r);
+            }
+        }
+    }
+}

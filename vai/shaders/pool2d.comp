@@ -1,0 +1,156 @@
+/*=============================================================================
+ pool2d.comp:
+     O[c, ho, wo] = reduce over the K×K window of I[c, ho*S - P + kh, wo*S - P + kw]
+
+ - poolMode (vai::PoolMode): 0 Max skips padding; 1 Avg divides the sum by the
+   window's area (windowArea), with padding counted when countIncludePad.
+ - [..., C, H, W], or [..., H, W, C] with channelsLast; Ho comes from the host,
+   rounded up with ceilMode, so a window may then run past the padding.
+ - CHW folds the leading axes into C on the host; HWC folds them into z, so a
+   window never crosses from one image into the next.
+ - O (typeO) and I (typeI) are fp32 or fp16, accessed through same-binding
+   buffer aliases; the reduction runs in fp32.
+ - aligned (HWC, C % 4 == 0): one thread owns 4 channels through vec4 aliases.
+ - Dispatch (host): HWC (C or C/4, Wo, B*Ho), CHW (Ho*Wo, B*C). The fastest axis
+   is the contiguous one, so neighbouring threads read neighbouring addresses;
+   CHW flattens (ho, wo) so a row narrower than a workgroup leaves no lanes idle.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = 0) const uint channelsLast = 0;           // 1: HWC, 0: CHW
+layout(constant_id = 1) const uint K = 1;                      // kernel side
+layout(constant_id = 2) const uint S = 1;                      // stride
+layout(constant_id = 3) const uint P = 0;                      // padding
+layout(constant_id = 4) const uint poolMode = 0;               // 0: Max, 1: Avg
+layout(constant_id = 5) const uint ceilMode = 0;               // 1: Ho rounds up
+layout(constant_id = 6) const uint countIncludePad = 1;        // Avg: padding counts in the area
+layout(constant_id = SPEC_ID_ALIGNED) const uint aligned = 0;  // 1: vec4 over channels
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;     // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;     // I (input) dtype
+
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F32  { float bufferO_f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_F16  { float16_t bufferO_f16[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F32 { vec4 bufferO_4f32[]; };
+layout(set = 0, binding = 0) restrict writeonly buffer O_BUF_4F16 { f16vec4 bufferO_4f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F32  { float bufferI_f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_F16  { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F32 { vec4 bufferI_4f32[]; };
+layout(set = 0, binding = 1) restrict readonly buffer I_BUF_4F16 { f16vec4 bufferI_4f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint Hi, Wi, Ho, Wo, C;
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+vec4 readI4(uint i) { return (typeI == DTYPE_F32) ? bufferI_4f32[i] : vec4(bufferI_4f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+void writeO4(uint i, vec4 v) { if (typeO == DTYPE_F32) bufferO_4f32[i] = v; else bufferO_4f16[i] = f16vec4(v); }
+
+#define FLT_LOWEST -3.402823466e+38
+
+// poolMode folds each of these to one side.
+float initAcc()                 { return poolMode == 0u ? FLT_LOWEST : 0.0; }
+float combine(float a, float v) { return poolMode == 0u ? max(a, v) : a + v; }
+vec4  combine(vec4 a, vec4 v)   { return poolMode == 0u ? max(a, v) : a + v; }
+float finish(float a, float area) { return poolMode == 0u ? a : a * (1.0 / area); }
+vec4  finish(vec4 a, float area)  { return poolMode == 0u ? a : a * (1.0 / area); }
+
+// Avg's divisor for the window at (h0, w0), as PyTorch counts it: the part
+// inside the padded image with countIncludePad, the part inside the image
+// without. It folds to K² unless a window can be clipped.
+float windowArea(int h0, int w0)
+{
+    int k = int(K);
+    if (countIncludePad != 0u)
+    {
+        if (ceilMode == 0u) return float(K * K);
+        return float((min(h0 + k, int(Hi + P)) - h0) * (min(w0 + k, int(Wi + P)) - w0));
+    }
+    if (P == 0u && ceilMode == 0u) return float(K * K);
+    return float((min(h0 + k, int(Hi)) - max(h0, 0)) * (min(w0 + k, int(Wi)) - max(w0, 0)));
+}
+
+// With no padding and no ceilMode every window lies inside the image, and these fold away.
+bool rowInside(int h) { return (P == 0u && ceilMode == 0u) || (h >= 0 && h < int(Hi)); }
+bool colInside(int w) { return (P == 0u && ceilMode == 0u) || (w >= 0 && w < int(Wi)); }
+
+// Each window starts at (h0, w0); a row steps by rowStep and a tap by colStep, so
+// the taps need no multiply. A negative start wraps in uint, and only taps
+// inside the image are read.
+
+void poolHWC()
+{
+    uint c = gl_GlobalInvocationID.x;
+    uint wo = gl_GlobalInvocationID.y;
+    uint z = gl_GlobalInvocationID.z;   // b * Ho + ho
+    uint colStep = (aligned != 0u) ? C / 4u : C;
+    if (c >= colStep || wo >= Wo) return;
+
+    int h0 = int((z % Ho) * S) - int(P);
+    int w0 = int(wo * S) - int(P);
+    uint rowStep = Wi * colStep;
+    uint rowStart = ((z / Ho * Hi + uint(h0)) * Wi + uint(w0)) * colStep + c;
+
+    if (aligned != 0u)
+    {
+        vec4 acc = vec4(initAcc());
+        [[unroll]] for (uint kh = 0u; kh < K; ++kh, rowStart += rowStep)
+        {
+            if (!rowInside(h0 + int(kh))) continue;
+            uint i = rowStart;
+            [[unroll]] for (uint kw = 0u; kw < K; ++kw, i += colStep)
+                if (colInside(w0 + int(kw)))
+                    acc = combine(acc, readI4(i));
+        }
+        writeO4((z * Wo + wo) * colStep + c, finish(acc, windowArea(h0, w0)));
+    }
+    else
+    {
+        float acc = initAcc();
+        [[unroll]] for (uint kh = 0u; kh < K; ++kh, rowStart += rowStep)
+        {
+            if (!rowInside(h0 + int(kh))) continue;
+            uint i = rowStart;
+            [[unroll]] for (uint kw = 0u; kw < K; ++kw, i += colStep)
+                if (colInside(w0 + int(kw)))
+                    acc = combine(acc, readI(i));
+        }
+        writeO((z * Wo + wo) * colStep + c, finish(acc, windowArea(h0, w0)));
+    }
+}
+
+void poolCHW()
+{
+    uint p = gl_GlobalInvocationID.x;
+    uint c = gl_GlobalInvocationID.y;
+    if (p >= Ho * Wo || c >= C) return;
+
+    int h0 = int((p / Wo) * S) - int(P);
+    int w0 = int((p % Wo) * S) - int(P);
+    uint rowStart = (c * Hi + uint(h0)) * Wi + uint(w0);
+
+    float acc = initAcc();
+    [[unroll]] for (uint kh = 0u; kh < K; ++kh, rowStart += Wi)
+    {
+        if (!rowInside(h0 + int(kh))) continue;
+        uint i = rowStart;
+        [[unroll]] for (uint kw = 0u; kw < K; ++kw, ++i)
+            if (colInside(w0 + int(kw)))
+                acc = combine(acc, readI(i));
+    }
+    writeO(c * Ho * Wo + p, finish(acc, windowArea(h0, w0)));
+}
+
+void main()
+{
+    if (channelsLast != 0u) poolHWC();
+    else                    poolCHW();
+}

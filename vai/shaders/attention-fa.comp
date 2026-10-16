@@ -1,0 +1,837 @@
+/*=============================================================================
+ attention-fa.comp: flash-attention scalar path, separate Q/K/V,
+     GQA (ported from the ggml/llama.cpp Vulkan flash_attn.comp scalar kernel)
+
+     1) append the new K / V tokens to the K / V cache (fused)
+     2) O[nq, h, dh] = sum_j softmax(Q[h, nq] · K(h/groupSize, j) * scale)[j] * V(h/groupSize, j, dh)
+
+     O is token-major [B, Tq, Hq, Dh]; O (typeO), the Q / K / V inputs (typeI)
+     and the K / V cache (typeCache) are fp32 or fp16 via same-binding vec4 buffer
+     aliases. Softmax state accumulates in fp32; the O accumulator follows
+     accF16.
+
+ Decomposition (wgRows / wgKv / dhSplit / rowGroups = ggml Br / Bc / D_split
+ / row_split): one workgroup owns a wgRows-row Q tile of one head; rowGroups
+ row-groups split the rows, dhSplit adjacent lanes split the head dim, and
+ the remaining lanes stripe the wgKv tile columns. Each thread runs an
+ independent online softmax over its own stripe; stripes merge once in the
+ epilogue (subgroupShuffleXor, + a shared stage when rowGroups == 1).
+
+ The KV sweep covers ONE global token range: position j reads cache[j] when
+ j < cached, else input[j - cached]; causality is a single compare (no mask
+ tensor). The KV-head-leader workgroup appends its rows' new tokens.
+
+ Sliding window (spec windowSize > 0): a query at position p attends
+ [p - windowSize + 1, p]. The lower bound joins the causal compare, and the sweep
+ skips the tiles below the whole tile's bound — so prefill costs O(N*windowSize)
+ rather than O(N^2). The cache still holds every token.
+
+ GQA-packed decode (push gqaRatio > 1): the tile rows become the groupSize query
+ heads sharing one KV head, so the sweep runs once per group; dispatch
+ flips to one workgroup per (token, KV head).
+
+ Split-K (push kCount > 1): the cache is cut into kCount spans of wgKv-
+ aligned length, derived here from kvCacheCount — the host cannot supply
+ it, as the cache grows under one recorded command buffer. Split s sweeps
+ span s; the LAST split extends through the new tokens, and split 0 owns the
+ append. A span past the cache end leaves that split empty, which the reduce
+ absorbs. Partials (bindings 7/8) are folded by
+ attention-fa-reduce.comp.
+
+ Requirements (host-gated): Dh % 8 == 0, 16 <= Dh <= 256; wgSize a multiple
+ of sgSize (forced on the pipeline); rowGroups > 1 implies wgSize ==
+ rowGroups * sgSize; wgKv a multiple of wgSize / dhSplit / rowGroups; Dh/4 a
+ multiple of dhSplit; shared-memory budget = ggmlFAScalarShmemSupport.
+
+ Dispatch (host): (ceil(Tq / wgRows) * kCount, Hq, B);
+                  GQA-packed: (Tq * kCount, Hkv, B)
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// No subgroup_extended_types_float16: the accF16 exchange shuffles uvec2-
+// packed halves — a f16 group op would demand shaderSubgroupExtendedTypes
+// (eva doesn't enable it) even as a spec-folded dead branch.
+#include "common/spec_constants.h"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;   // = wgSize (same SpecId)
+
+layout(constant_id = 0) const uint wgSize       = 128;  // threads per workgroup (= local_size_x)
+layout(constant_id = 1) const uint wgRows       = 4;    // Q rows per workgroup tile
+layout(constant_id = 2) const uint wgKv         = 32;   // KV columns per tile iteration
+layout(constant_id = 3) const uint Dh           = 64;   // head dim
+layout(constant_id = 4) const uint dhSplit      = 8;    // adjacent lanes splitting the head dim
+layout(constant_id = 5) const uint rowGroups    = 1;    // row-groups per workgroup (1 or 4)
+layout(constant_id = 6) const uint sgSize       = 32;   // forced subgroup size (0 = don't force; shared-tree epilogue)
+layout(constant_id = 7) const uint shmemStaging = 0;    // stage K/V tiles through shared memory
+layout(constant_id = 8) const uint stagingF16   = 0;    // f16 shared staging (= upstream FLOAT_TYPE on fp16 devices; acc stays fp32)
+layout(constant_id = 9) const uint limitShmem   = 0;    // vec4s of dead shared to cap occupancy (= ggml LIMIT_OCCUPANCY_SHMEM; AMD)
+// f16 O accumulator registers + epilogue exchange; softmax state stays fp32.
+// The packed exchange also sidesteps the broken f16vec4 shuffle upstream
+// works around on old AMD Windows drivers (OLD_AMD_WINDOWS).
+layout(constant_id = 10) const uint accF16 = 0;
+layout(constant_id = 12) const uint windowSize = 0;    // sliding-window span (0 = unbounded)
+layout(constant_id = 13) const uint typeI      = 0;    // Q / K / V input dtype
+layout(constant_id = 14) const uint typeCache  = 0;    // K / V cache dtype
+layout(constant_id = 15) const uint kvCaching  = 1;    // 0: skip the append; the cache bindings are null
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+
+// All indices below are in vec4 units (Dh % 4 == 0 is host-guaranteed).
+// Aliases carry the tightest memory qualifier: read-write aliases would block
+// load batching across the append stores. The caches get a readonly alias for
+// the sweep plus a writeonly alias for the append (same binding, disjoint).
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F32 { vec4 bufferO_f32[]; };   // attention O [B, Tq, Hq, Dh]
+layout(set = 0, binding = 0) writeonly buffer O_BUF_F16 { f16vec4 bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer Q_BUF_F32 { vec4 bufferQ_f32[]; };   // query Q [B, Hq, Tq, Dh]
+layout(set = 0, binding = 1) readonly buffer Q_BUF_F16 { f16vec4 bufferQ_f16[]; };
+layout(set = 0, binding = 2) readonly buffer K_BUF_F32 { vec4 bufferK_f32[]; };   // key   K [B, Hkv, Tq, Dh] (new tokens)
+layout(set = 0, binding = 2) readonly buffer K_BUF_F16 { f16vec4 bufferK_f16[]; };
+layout(set = 0, binding = 3) readonly buffer V_BUF_F32 { vec4 bufferV_f32[]; };   // value V [B, Hkv, Tq, Dh] (new tokens)
+layout(set = 0, binding = 3) readonly buffer V_BUF_F16 { f16vec4 bufferV_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 4) readonly buffer KCACHE_BUF_F32 { vec4 bufferKCache_f32[]; };   // K cache [B, Hkv, Tmax, Dh]
+layout(set = 0, binding = 4) readonly buffer KCACHE_BUF_F16 { f16vec4 bufferKCache_f16[]; };
+layout(set = 0, binding = 4) writeonly buffer KCACHE_W_F32  { vec4 bufferKCacheW_f32[]; };
+layout(set = 0, binding = 4) writeonly buffer KCACHE_W_F16  { f16vec4 bufferKCacheW_f16[]; };
+layout(set = 0, binding = 5) readonly buffer VCACHE_BUF_F32 { vec4 bufferVCache_f32[]; };   // V cache [B, Hkv, Tmax, Dh]
+layout(set = 0, binding = 5) readonly buffer VCACHE_BUF_F16 { f16vec4 bufferVCache_f16[]; };
+layout(set = 0, binding = 5) writeonly buffer VCACHE_W_F32  { vec4 bufferVCacheW_f32[]; };
+layout(set = 0, binding = 5) writeonly buffer VCACHE_W_F16  { f16vec4 bufferVCacheW_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 6) uniform UB { uint kvCacheCount; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 7) buffer PO_BUF  { vec4 partialO[];   };   // [B*Tq*Hq, kCount, Dh/4] unnormalized acc (fp32)
+layout(set = 0, binding = 8) buffer PML_BUF { float partialML[]; };   // [B*Tq*Hq, kCount, (m, l)] (fp32)
+
+layout(push_constant) uniform PushConstants {
+    uint DhPush;     // unused (Dh is a spec constant); keeps the naive kernel's layout
+    uint Hq;
+    uint groupSize;  // Hq / Hkv: query heads sharing one KV head
+    uint Tq;
+    uint Tmax;
+    uint gqaRatio;   // > 1: GQA-packed decode (tile rows = the groupSize heads of one KV group)
+    uint kCount;     // KV splits (1 = no split; > 1 = two-pass with the reduce kernel)
+    float scale;
+};
+
+#define CAUSAL_MASK_BINDING 9
+#include "common/causal_mask.h"
+
+// O and the split-K partials are both indexed by this row, so the reduce pass
+// writes straight through. With one sequence b is 0 and it is the plain
+// token-major row.
+uint outRow(uint tq, uint hq) { return (gl_WorkGroupID.z * Tq + tq) * Hq + hq; }
+
+vec4 readQ4(uint i) { return (typeI == DTYPE_F32) ? bufferQ_f32[i] : vec4(bufferQ_f16[i]); }
+// Direct-to-f16 staging readers: f16 sources copy without a f32 roundtrip.
+f16vec4 readQ4h(uint i) { return (typeI == DTYPE_F32) ? f16vec4(bufferQ_f32[i]) : bufferQ_f16[i]; }
+f16vec4 readK4h(uint i) { return (typeI == DTYPE_F32) ? f16vec4(bufferK_f32[i]) : bufferK_f16[i]; }
+f16vec4 readV4h(uint i) { return (typeI == DTYPE_F32) ? f16vec4(bufferV_f32[i]) : bufferV_f16[i]; }
+f16vec4 readKCache4h(uint i) { return (typeCache == DTYPE_F32) ? f16vec4(bufferKCache_f32[i]) : bufferKCache_f16[i]; }
+f16vec4 readVCache4h(uint i) { return (typeCache == DTYPE_F32) ? f16vec4(bufferVCache_f32[i]) : bufferVCache_f16[i]; }
+vec4 readK4(uint i) { return (typeI == DTYPE_F32) ? bufferK_f32[i] : vec4(bufferK_f16[i]); }
+vec4 readV4(uint i) { return (typeI == DTYPE_F32) ? bufferV_f32[i] : vec4(bufferV_f16[i]); }
+vec4 readKCache4(uint i) { return (typeCache == DTYPE_F32) ? bufferKCache_f32[i] : vec4(bufferKCache_f16[i]); }
+vec4 readVCache4(uint i) { return (typeCache == DTYPE_F32) ? bufferVCache_f32[i] : vec4(bufferVCache_f16[i]); }
+void writeO4(uint i, vec4 v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = f16vec4(v); }
+void writeKCache4(uint i, vec4 v) { if (typeCache == DTYPE_F32) bufferKCacheW_f32[i] = v; else bufferKCacheW_f16[i] = f16vec4(v); }
+void writeVCache4(uint i, vec4 v) { if (typeCache == DTYPE_F32) bufferVCacheW_f32[i] = v; else bufferVCacheW_f16[i] = f16vec4(v); }
+// Append copies without the f32 roundtrip when both ends are f16 (spec-folded).
+void copyKToCache(uint dst, uint src)
+{
+    if (typeI != DTYPE_F32 && typeCache != DTYPE_F32) bufferKCacheW_f16[dst] = bufferK_f16[src];
+    else writeKCache4(dst, readK4(src));
+}
+void copyVToCache(uint dst, uint src)
+{
+    if (typeI != DTYPE_F32 && typeCache != DTYPE_F32) bufferVCacheW_f16[dst] = bufferV_f16[src];
+    else writeVCache4(dst, readV4(src));
+}
+
+// Derived decomposition constants
+const uint ROWGROUP_THREADS = wgSize / rowGroups;   // threads cooperating on one row-group
+const uint ROWS_PER_THREAD  = wgRows / rowGroups;
+const uint COLS_PER_STEP    = ROWGROUP_THREADS / dhSplit;   // tile columns covered per c-iteration
+const uint COLS_PER_THREAD  = wgKv / COLS_PER_STEP;
+const uint DH4              = Dh / 4u;              // head dim in vec4s
+const uint DH4_PER_THREAD   = DH4 / dhSplit;
+const uint NUM_SG           = (sgSize > 0u) ? wgSize / sgSize : 1u;
+const uint SHMEM_STRIDE     = DH4 + 1u;   // +1 vec4 avoids shared-memory bank conflicts
+
+// exp(x - m) == 0 exactly for excluded positions; m never reaches -inf
+// because row maxima start at -1e30.
+#define NEG_INF uintBitsToFloat(0xFF800000u)
+const float QK_MAX_OFFSET = 3.0 * 0.6931;   // ~ln(8): keeps p <= 1/8 (ggml FATTN_KQ_MAX_OFFSET)
+
+// Staging in fp32 or f16 (stagingF16); loads widen to vec4 so every fma
+// stays fp32.
+shared vec4 s_q32[(stagingF16 == 0u) ? wgRows * SHMEM_STRIDE : 1u];   // Q tile, pre-scaled
+shared f16vec4 s_q16[(stagingF16 != 0u) ? wgRows * SHMEM_STRIDE : 1u];
+shared vec4 s_kv32[(stagingF16 == 0u && shmemStaging != 0u) ? wgKv * SHMEM_STRIDE : 1u]; // K then V
+shared f16vec4 s_kv16[(stagingF16 != 0u && shmemStaging != 0u) ? wgKv * SHMEM_STRIDE : 1u];
+
+vec4 loadQs(uint i)  { return (stagingF16 != 0u) ? vec4(s_q16[i])  : s_q32[i]; }
+vec4 loadKVs(uint i) { return (stagingF16 != 0u) ? vec4(s_kv16[i]) : s_kv32[i]; }
+
+// Cross-subgroup epilogue scratch (= ggml tmpsh/tmpshv4): scalars (m, l) in
+// s_red, acc vec4s in s_redv4.
+const uint RED_ENTRIES = (sgSize == 0u) ? wgSize : ((rowGroups == 1u) ? NUM_SG * dhSplit : NUM_SG);
+shared float s_red[RED_ENTRIES];
+shared vec4 s_redv4[(accF16 == 0u) ? RED_ENTRIES : 1u];         // acc exchange (fp32)
+shared f16vec4 s_redv4h[(accF16 != 0u) ? RED_ENTRIES : 1u];     // acc exchange (accF16, = upstream tmpshv4)
+shared vec4 s_occupancy[(limitShmem > 0u) ? limitShmem : 1u];   // = ggml occupancy_limiter
+
+// Tile-local row -> (query head, query token); rows past the valid range are
+// zero-filled / skipped. Non-packed: rows are Q tokens of head wgY. Packed:
+// rows are the gqaRatio query heads of KV group wgY, all at token qTile.
+#define ROW_HEAD(row)  (packed ? wgY * gqaRatio + (row) : wgY)
+#define ROW_TOK(row)   (packed ? qTile : qTile * wgRows + (row))
+#define ROW_VALID(row) (packed ? (row) < gqaRatio : qTile * wgRows + (row) < Tq)
+
+
+void main()
+{
+    const uint split = gl_WorkGroupID.x % kCount;   // my KV split
+    const uint qTile = gl_WorkGroupID.x / kCount;   // Q row-tile index; packed: token index
+    const uint wgY   = gl_WorkGroupID.y;          // query head; packed: KV head
+    const uint tid   = gl_LocalInvocationID.x;
+    const bool packed = (gqaRatio > 1u);
+
+    if (limitShmem > 0u)
+    {
+        // Keeps s_occupancy from being optimized out (= ggml).
+        s_occupancy[tid] = vec4(tid);
+        barrier();
+        if (s_occupancy[tid] == vec4(99999.0))
+            writeO4(0u, s_occupancy[tid]);
+    }
+
+    const uint rowGroup = tid / ROWGROUP_THREADS;   // my row-group
+    const uint groupTid = tid % ROWGROUP_THREADS;
+    const uint dhLane   = groupTid % dhSplit;       // my head-dim slice (vec4 granular)
+    const uint colLane  = groupTid / dhSplit;       // my column stripe
+
+    // The sequence rode in on the grid's z, which this kernel never used, so
+    // the head index stays the model's and nothing has to be divided apart.
+    const uint b           = gl_WorkGroupID.z;
+    const uint qHeadBase   = b * Hq;
+    const uint Hkv         = Hq / groupSize;   // KV heads one sequence's block holds
+    const uint kvHead      = b * Hkv + (packed ? wgY : wgY / groupSize);
+    const uint kvCacheBase = kvHead * Tmax  * DH4;     // vec4 units
+    const uint kvInputBase = kvHead * Tq * DH4;
+    const uint rowBase     = rowGroup * ROWS_PER_THREAD;   // first row of my row-group (tile-local)
+
+    // Q tile to shared, unscaled; rows past Tq zero-filled. NOTE: ggml
+    // pre-scales at staging — vai post-scales the qk sum (keeps f16 Q exact).
+    [[unroll]] for (uint idx = tid; idx < wgRows * DH4; idx += wgSize)
+    {
+        uint row = idx / DH4, d = idx % DH4;
+        if (stagingF16 != 0u)
+            s_q16[row * SHMEM_STRIDE + d] = ROW_VALID(row)
+                ? readQ4h((qHeadBase + ROW_HEAD(row)) * Tq * DH4 + ROW_TOK(row) * DH4 + d) : f16vec4(0.0);
+        else
+            s_q32[row * SHMEM_STRIDE + d] = ROW_VALID(row)
+                ? readQ4((qHeadBase + ROW_HEAD(row)) * Tq * DH4 + ROW_TOK(row) * DH4 + d) : vec4(0.0);
+    }
+
+    // Fused append (split 0 only; non-packed: the KV-head-leader workgroup),
+    // vec4-owned; no barrier — the sweep never reads cache[>= cached].
+    // kvCaching == 0 skips it: the cache descriptors are null.
+    if (kvCaching != 0u && packed && split == 0u)
+    {
+        [[unroll]] for (uint d = tid; d < DH4; d += wgSize)
+        {
+            uint src = kvInputBase + qTile * DH4 + d;
+            uint dst = kvCacheBase + (kvCacheCount + qTile) * DH4 + d;
+            copyKToCache(dst, src);
+            copyVToCache(dst, src);
+        }
+    }
+    else if (kvCaching != 0u && !packed && split == 0u && wgY % groupSize == 0u)
+    {
+        [[unroll]] for (uint idx = tid; idx < wgRows * DH4; idx += wgSize)
+        {
+            uint row = idx / DH4, d = idx % DH4;
+            uint tok = qTile * wgRows + row;
+            if (tok < Tq)
+            {
+                uint src = kvInputBase + tok * DH4 + d;
+                uint dst = kvCacheBase + (kvCacheCount + tok) * DH4 + d;
+                copyKToCache(dst, src);
+                copyVToCache(dst, src);
+            }
+        }
+    }
+    barrier();   // s_q ready
+
+    // Per-thread online softmax state, private to my column stripe; m/l fp32,
+    // the running numerator follows accF16.
+    float m[ROWS_PER_THREAD];                     // running max
+    float l[ROWS_PER_THREAD];                     // running denominator
+    vec4 acc32[(accF16 == 0u) ? ROWS_PER_THREAD * DH4_PER_THREAD : 1u];
+    f16vec4 acc16[(accF16 != 0u) ? ROWS_PER_THREAD * DH4_PER_THREAD : 1u];
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r) { m[r] = -1e30; l[r] = 0.0; }
+    [[unroll]] for (uint x = 0u; x < ROWS_PER_THREAD * DH4_PER_THREAD; ++x)
+    {
+        if (accF16 != 0u) acc16[x] = f16vec4(0.0);
+        else acc32[x] = vec4(0.0);
+    }
+
+    // Unified KV sweep in global token coordinates: position j reads cache[j]
+    // when j < cached, else input[j - cached]; only one tile per split mixes
+    // the two sources.
+    {
+        const uint inputEnd = kvCacheCount + Tq;   // token count after append
+
+        // Split-K: my cache subrange; the last split extends through the new
+        // tokens (tiles wholly past the causal end are skipped analytically).
+        // The span comes from the live cache, not the host: the command buffer
+        // outlives the cache length it was recorded at.
+        const uint splitSpan = (((kvCacheCount + kCount - 1u) / kCount) + wgKv - 1u) & ~(wgKv - 1u);
+        const uint spanStart = min(split * splitSpan, kvCacheCount);
+        // newTokenEnd rises with the row, so the tile's last row bounds the tile.
+        const uint lastRowTok = packed ? qTile : min(Tq, qTile * wgRows + wgRows) - 1u;
+        const uint sweepEnd = (split == kCount - 1u)
+            ? kvCacheCount + newTokenEnd(lastRowTok)
+            : min(kvCacheCount, spanStart + splitSpan);
+
+        // Windowed sweeps start at the bound of the tile's OLDEST row, so the
+        // start stays workgroup-uniform (the tile loop carries barriers) and no
+        // split's end moves — the spans must stay contiguous and disjoint.
+        const uint qPosFirst = kvCacheCount + ROW_TOK(0u);
+        const uint winStart  = (windowSize == 0u || qPosFirst < windowSize) ? 0u : qPosFirst + 1u - windowSize;
+        const uint jStart    = max(spanStart, winStart);
+
+        // Per-row bound, causality, window and split range in one pair of
+        // compares: j belongs to me iff causalStart[row] <= j <= causalEnd[row].
+        // The sweepEnd term binds only when the cache ends mid-tile — the tile
+        // loop still runs that whole tile, and the new tokens inside it are the
+        // LAST split's.
+        uint causalEnd[ROWS_PER_THREAD];
+        uint causalStart[ROWS_PER_THREAD];
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+        {
+            uint rowTok = ROW_TOK(rowBase + r);
+            uint qPos = kvCacheCount + rowTok;
+            causalEnd[r]   = min(kvCacheCount + newTokenEnd(rowTok) - 1u, sweepEnd - 1u);
+            causalStart[r] = (windowSize == 0u || qPos < windowSize) ? 0u : qPos + 1u - windowSize;
+        }
+
+        [[dont_unroll]]
+        for (uint jBase = jStart; jBase < sweepEnd; jBase += wgKv)
+        {
+            // Tile classes (workgroup-uniform; at most one boundary tile per split).
+            const bool fullCache = jBase + wgKv <= kvCacheCount;
+            const bool fullInput = jBase >= kvCacheCount && jBase + wgKv <= inputEnd;
+            // (a) K tile to shared (optional): full tiles copy from one hoisted
+            // source, the boundary tile selects/zero-fills per element. Keep the
+            // `idx = idx0 + tid` idiom ([[unroll]] batching; the Q/append loops
+            // above intentionally keep the runtime-bound form).
+            if (shmemStaging != 0u)
+            {
+                barrier();   // previous tile's V reads done with s_kv
+                if (fullCache)
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint g = kvCacheBase + jBase * DH4 + idx;
+                            if (stagingF16 != 0u) s_kv16[c * SHMEM_STRIDE + d] = readKCache4h(g);
+                            else s_kv32[c * SHMEM_STRIDE + d] = readKCache4(g);
+                        }
+                    }
+                }
+                else if (fullInput)
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint g = kvInputBase + (jBase - kvCacheCount) * DH4 + idx;
+                            if (stagingF16 != 0u) s_kv16[c * SHMEM_STRIDE + d] = readK4h(g);
+                            else s_kv32[c * SHMEM_STRIDE + d] = readK4(g);
+                        }
+                    }
+                }
+                else
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint j = jBase + c;
+                            if (stagingF16 != 0u)
+                            {
+                                f16vec4 v = f16vec4(0.0);
+                                if (j < kvCacheCount) v = readKCache4h(kvCacheBase + j * DH4 + d);
+                                else if (j < inputEnd)    v = readK4h(kvInputBase + (j - kvCacheCount) * DH4 + d);
+                                s_kv16[c * SHMEM_STRIDE + d] = v;
+                            }
+                            else
+                            {
+                                vec4 v = vec4(0.0);
+                                if (j < kvCacheCount) v = readKCache4(kvCacheBase + j * DH4 + d);
+                                else if (j < inputEnd)    v = readK4(kvInputBase + (j - kvCacheCount) * DH4 + d);
+                                s_kv32[c * SHMEM_STRIDE + d] = v;
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+
+            // (b) qk = Q · Kᵀ: each lane holds a dhSplit-th of the dot,
+            // completed by the shuffle pass below (kept separate — folding it
+            // into the column loop serializes the critical path).
+            float qk[ROWS_PER_THREAD * COLS_PER_THREAD];
+            [[unroll]] for (uint x = 0u; x < ROWS_PER_THREAD * COLS_PER_THREAD; ++x) qk[x] = 0.0;
+            // Unstaged full-tile fast path: bounds provably hold, the source
+            // hoists to a uniform branch; staged pipelines fold this away.
+            if (shmemStaging == 0u && fullCache)
+            {
+                [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+                {
+                    uint kOff = kvCacheBase + (jBase + c * COLS_PER_STEP + colLane) * DH4 + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 kv = readKCache4(kOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                            qk[r * COLS_PER_THREAD + c] += dot(
+                                loadQs((rowBase + r) * SHMEM_STRIDE + dhLane + d * dhSplit), kv);
+                    }
+                }
+            }
+            else if (shmemStaging == 0u && fullInput)
+            {
+                [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+                {
+                    uint kOff = kvInputBase
+                              + (jBase - kvCacheCount + c * COLS_PER_STEP + colLane) * DH4 + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 kv = readK4(kOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                            qk[r * COLS_PER_THREAD + c] += dot(
+                                loadQs((rowBase + r) * SHMEM_STRIDE + dhLane + d * dhSplit), kv);
+                    }
+                }
+            }
+            else
+            [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+            {
+                uint j = jBase + c * COLS_PER_STEP + colLane;
+                if (shmemStaging != 0u)
+                {
+                    uint kOff = (j - jBase) * SHMEM_STRIDE + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 kv = loadKVs(kOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                            qk[r * COLS_PER_THREAD + c] += dot(
+                                loadQs((rowBase + r) * SHMEM_STRIDE + dhLane + d * dhSplit), kv);
+                    }
+                }
+                else if (j < inputEnd)
+                {
+                    uint kOff = (j < kvCacheCount)
+                              ? kvCacheBase + j * DH4 + dhLane
+                              : kvInputBase + (j - kvCacheCount) * DH4 + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 kv = (j < kvCacheCount) ? readKCache4(kOff + d * dhSplit)
+                                                         : readK4(kOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                            qk[r * COLS_PER_THREAD + c] += dot(
+                                loadQs((rowBase + r) * SHMEM_STRIDE + dhLane + d * dhSplit), kv);
+                    }
+                }
+            }
+            [[unroll]] for (uint hop = dhSplit / 2u; hop > 0u; hop >>= 1u)
+                [[unroll]] for (uint x = 0u; x < ROWS_PER_THREAD * COLS_PER_THREAD; ++x)
+                    qk[x] += subgroupShuffleXor(qk[x], hop);
+            // Full cache tile (unstaged): every position included, so exclusion
+            // folds to the plain scale (staged: measured and rejected). A window
+            // can cut such a tile from below, so it keeps the compare.
+            if (shmemStaging == 0u && fullCache && windowSize == 0u)
+            {
+                [[unroll]] for (uint x = 0u; x < ROWS_PER_THREAD * COLS_PER_THREAD; ++x)
+                    qk[x] *= scale;
+            }
+            else
+            [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+            {
+                uint j = jBase + c * COLS_PER_STEP + colLane;
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                {
+                    // Causality, window and range exclusion in one compare pair.
+                    qk[r * COLS_PER_THREAD + c] = (j <= causalEnd[r] && j >= causalStart[r])
+                        ? qk[r * COLS_PER_THREAD + c] * scale : NEG_INF;
+                }
+            }
+
+            // (c) Online softmax update over my stripe.
+            [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+            {
+                float rowMax = -1e30;
+                [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+                    rowMax = max(rowMax, qk[r * COLS_PER_THREAD + c]);
+                rowMax += QK_MAX_OFFSET;
+
+                float mPrev = m[r];
+                m[r] = max(rowMax, mPrev);
+                float corr = exp(mPrev - m[r]);
+                l[r] *= corr;
+                [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                {
+                    if (accF16 != 0u) acc16[r * DH4_PER_THREAD + d] *= float16_t(corr);
+                    else acc32[r * DH4_PER_THREAD + d] *= corr;
+                }
+            }
+
+            // (d) V tile to shared (optional), reusing s_kv; same classes as (a).
+            if (shmemStaging != 0u)
+            {
+                barrier();   // qk reads done with s_kv (K)
+                if (fullCache)
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint g = kvCacheBase + jBase * DH4 + idx;
+                            if (stagingF16 != 0u) s_kv16[c * SHMEM_STRIDE + d] = readVCache4h(g);
+                            else s_kv32[c * SHMEM_STRIDE + d] = readVCache4(g);
+                        }
+                    }
+                }
+                else if (fullInput)
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint g = kvInputBase + (jBase - kvCacheCount) * DH4 + idx;
+                            if (stagingF16 != 0u) s_kv16[c * SHMEM_STRIDE + d] = readV4h(g);
+                            else s_kv32[c * SHMEM_STRIDE + d] = readV4(g);
+                        }
+                    }
+                }
+                else
+                {
+                    [[unroll]] for (uint idx0 = 0u; idx0 < wgKv * DH4; idx0 += wgSize)
+                    {
+                        uint idx = idx0 + tid;
+                        if (idx0 + wgSize <= wgKv * DH4 || idx < wgKv * DH4)
+                        {
+                            uint c = idx / DH4, d = idx % DH4;
+                            uint j = jBase + c;
+                            if (stagingF16 != 0u)
+                            {
+                                f16vec4 v = f16vec4(0.0);
+                                if (j < kvCacheCount) v = readVCache4h(kvCacheBase + j * DH4 + d);
+                                else if (j < inputEnd)    v = readV4h(kvInputBase + (j - kvCacheCount) * DH4 + d);
+                                s_kv16[c * SHMEM_STRIDE + d] = v;
+                            }
+                            else
+                            {
+                                vec4 v = vec4(0.0);
+                                if (j < kvCacheCount) v = readVCache4(kvCacheBase + j * DH4 + d);
+                                else if (j < inputEnd)    v = readV4(kvInputBase + (j - kvCacheCount) * DH4 + d);
+                                s_kv32[c * SHMEM_STRIDE + d] = v;
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+
+            // (e) p = exp(qk - m) into l and acc; excluded positions add exactly
+            // 0 (qk == -inf). Full tiles take the same fast paths as (b).
+            if (shmemStaging == 0u && fullCache)
+            {
+                [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+                {
+                    float p[ROWS_PER_THREAD];
+                    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                    {
+                        p[r] = exp(qk[r * COLS_PER_THREAD + c] - m[r]);
+                        l[r] += p[r];
+                    }
+                    uint vOff = kvCacheBase + (jBase + c * COLS_PER_STEP + colLane) * DH4 + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 v = readVCache4(vOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                        {
+                            // accF16: product in fp32, accumulate in f16.
+                            if (accF16 != 0u) acc16[r * DH4_PER_THREAD + d] += f16vec4(p[r] * v);
+                            else acc32[r * DH4_PER_THREAD + d] += p[r] * v;
+                        }
+                    }
+                }
+            }
+            else if (shmemStaging == 0u && fullInput)
+            {
+                [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+                {
+                    float p[ROWS_PER_THREAD];
+                    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                    {
+                        p[r] = exp(qk[r * COLS_PER_THREAD + c] - m[r]);
+                        l[r] += p[r];
+                    }
+                    uint vOff = kvInputBase
+                              + (jBase - kvCacheCount + c * COLS_PER_STEP + colLane) * DH4 + dhLane;
+                    [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                    {
+                        vec4 v = readV4(vOff + d * dhSplit);
+                        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                        {
+                            // accF16: product in fp32, accumulate in f16.
+                            if (accF16 != 0u) acc16[r * DH4_PER_THREAD + d] += f16vec4(p[r] * v);
+                            else acc32[r * DH4_PER_THREAD + d] += p[r] * v;
+                        }
+                    }
+                }
+            }
+            else
+            [[unroll]] for (uint c = 0u; c < COLS_PER_THREAD; ++c)
+            {
+                uint j = jBase + c * COLS_PER_STEP + colLane;
+                float p[ROWS_PER_THREAD];
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                {
+                    p[r] = exp(qk[r * COLS_PER_THREAD + c] - m[r]);
+                    l[r] += p[r];
+                }
+                [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                {
+                    vec4 v;
+                    if (shmemStaging != 0u)
+                        v = loadKVs((c * COLS_PER_STEP + colLane) * SHMEM_STRIDE + d * dhSplit + dhLane);
+                    else if (j < kvCacheCount)
+                        v = readVCache4(kvCacheBase + j * DH4 + d * dhSplit + dhLane);
+                    else
+                        v = (j < inputEnd)
+                            ? readV4(kvInputBase + (j - kvCacheCount) * DH4 + d * dhSplit + dhLane)
+                            : vec4(0.0);
+                    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+                    {
+                        if (accF16 != 0u) acc16[r * DH4_PER_THREAD + d] += f16vec4(p[r] * v);
+                        else acc32[r * DH4_PER_THREAD + d] += p[r] * v;
+                    }
+                }
+            }
+        }
+    }
+
+    // Epilogue: merge the per-thread stripes. Shuffles start at stride dhSplit
+    // (head-dim lanes stay distinct); a shared stage across subgroups is only
+    // needed when rowGroups == 1.
+    barrier();   // s_red / s_redv4
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+    {
+        // Row max.
+        float rowMax = m[r];
+        if (sgSize > 0u)
+        {
+            [[unroll]] for (uint hop = dhSplit; hop < sgSize; hop <<= 1u)
+                rowMax = max(rowMax, subgroupShuffleXor(rowMax, hop));
+            if (rowGroups == 1u && NUM_SG > 1u)
+            {
+                if (gl_SubgroupInvocationID < dhSplit)
+                    s_red[gl_SubgroupID * dhSplit + gl_SubgroupInvocationID] = rowMax;
+                barrier();
+                rowMax = s_red[dhLane];
+                [[unroll]] for (uint g = 1u; g < NUM_SG; ++g)
+                    rowMax = max(rowMax, s_red[g * dhSplit + dhLane]);
+                barrier();
+            }
+        }
+        else
+        {
+            // Shared tree over the row-group.
+            s_red[tid] = rowMax;
+            barrier();
+            [[unroll]] for (int s = int(ROWGROUP_THREADS) / 2; s >= int(dhSplit); s >>= 1)
+            {
+                if (groupTid < uint(s))
+                    s_red[tid] = max(s_red[tid], s_red[tid ^ uint(s)]);
+                barrier();
+            }
+            rowMax = s_red[rowGroup * ROWGROUP_THREADS + dhLane];
+            barrier();
+        }
+
+        float mPrev = m[r];
+        m[r] = max(rowMax, mPrev);
+        float corr = exp(mPrev - m[r]);
+
+        // l sum (each stripe rescaled to the shared max first).
+        l[r] *= corr;
+        if (sgSize > 0u)
+        {
+            [[unroll]] for (uint hop = dhSplit; hop < sgSize; hop <<= 1u)
+                l[r] += subgroupShuffleXor(l[r], hop);
+            if (rowGroups == 1u && NUM_SG > 1u)
+            {
+                if (gl_SubgroupInvocationID < dhSplit)
+                    s_red[gl_SubgroupID * dhSplit + gl_SubgroupInvocationID] = l[r];
+                barrier();
+                float lSum = s_red[dhLane];
+                [[unroll]] for (uint g = 1u; g < NUM_SG; ++g)
+                    lSum += s_red[g * dhSplit + dhLane];
+                l[r] = lSum;
+                barrier();
+            }
+        }
+        else
+        {
+            s_red[tid] = l[r];
+            barrier();
+            [[unroll]] for (int s = int(ROWGROUP_THREADS) / 2; s >= int(dhSplit); s >>= 1)
+            {
+                if (groupTid < uint(s))
+                    s_red[tid] = s_red[tid] + s_red[tid ^ uint(s)];
+                barrier();
+            }
+            l[r] = s_red[rowGroup * ROWGROUP_THREADS + dhLane];
+            barrier();
+        }
+
+        // acc sum, whole vec4 per head-dim slot; accF16 runs the whole
+        // exchange on f16vec4 — half the shuffle/shared traffic.
+        [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+        {
+            if (accF16 != 0u)
+            {
+                f16vec4 o4 = acc16[r * DH4_PER_THREAD + d] * float16_t(corr);
+                if (sgSize > 0u)
+                {
+                    // uvec2-packed shuffle (see the extension note up top)
+                    [[unroll]] for (uint hop = dhSplit; hop < sgSize; hop <<= 1u)
+                    {
+                        uvec2 pk = uvec2(packFloat2x16(o4.xy), packFloat2x16(o4.zw));
+                        pk = subgroupShuffleXor(pk, hop);
+                        o4 += f16vec4(unpackFloat2x16(pk.x), unpackFloat2x16(pk.y));
+                    }
+                    if (rowGroups == 1u && NUM_SG > 1u)
+                    {
+                        if (gl_SubgroupInvocationID < dhSplit)
+                            s_redv4h[gl_SubgroupID * dhSplit + gl_SubgroupInvocationID] = o4;
+                        barrier();
+                        o4 = s_redv4h[dhLane];
+                        [[unroll]] for (uint g = 1u; g < NUM_SG; ++g)
+                            o4 += s_redv4h[g * dhSplit + dhLane];
+                        barrier();
+                    }
+                }
+                else
+                {
+                    s_redv4h[tid] = o4;
+                    barrier();
+                    [[unroll]] for (int s = int(ROWGROUP_THREADS) / 2; s >= int(dhSplit); s >>= 1)
+                    {
+                        if (groupTid < uint(s))
+                        {
+                            o4 += s_redv4h[tid ^ uint(s)];
+                            s_redv4h[tid] = o4;
+                        }
+                        barrier();
+                    }
+                    o4 = s_redv4h[rowGroup * ROWGROUP_THREADS + dhLane];
+                    barrier();
+                }
+                acc16[r * DH4_PER_THREAD + d] = o4;
+            }
+            else
+            {
+                vec4 o4 = acc32[r * DH4_PER_THREAD + d] * corr;
+                if (sgSize > 0u)
+                {
+                    [[unroll]] for (uint hop = dhSplit; hop < sgSize; hop <<= 1u)
+                        o4 += subgroupShuffleXor(o4, hop);
+                    if (rowGroups == 1u && NUM_SG > 1u)
+                    {
+                        if (gl_SubgroupInvocationID < dhSplit)
+                            s_redv4[gl_SubgroupID * dhSplit + gl_SubgroupInvocationID] = o4;
+                        barrier();
+                        o4 = s_redv4[dhLane];
+                        [[unroll]] for (uint g = 1u; g < NUM_SG; ++g)
+                            o4 += s_redv4[g * dhSplit + dhLane];
+                        barrier();
+                    }
+                }
+                else
+                {
+                    s_redv4[tid] = o4;
+                    barrier();
+                    [[unroll]] for (int s = int(ROWGROUP_THREADS) / 2; s >= int(dhSplit); s >>= 1)
+                    {
+                        if (groupTid < uint(s))
+                        {
+                            o4 += s_redv4[tid ^ uint(s)];
+                            s_redv4[tid] = o4;
+                        }
+                        barrier();
+                    }
+                    o4 = s_redv4[rowGroup * ROWGROUP_THREADS + dhLane];
+                    barrier();
+                }
+                acc32[r * DH4_PER_THREAD + d] = o4;
+            }
+        }
+    }
+
+    if (kCount > 1u)
+    {
+        // Split partials: unnormalized acc + per-row (m, l) for the reduce
+        // pass; empty splits naturally write (m=-1e30, l=0, acc=0).
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+        {
+            uint row = rowBase + r;
+            if (!ROW_VALID(row)) continue;
+            uint rowIdx = outRow(ROW_TOK(row), ROW_HEAD(row));
+            [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+                partialO[(rowIdx * kCount + split) * DH4 + d * dhSplit + dhLane]
+                    = (accF16 != 0u) ? vec4(acc16[r * DH4_PER_THREAD + d])
+                                     : acc32[r * DH4_PER_THREAD + d];
+            if (dhLane == 0u && colLane == 0u)
+            {
+                partialML[(rowIdx * kCount + split) * 2u]      = m[r];
+                partialML[(rowIdx * kCount + split) * 2u + 1u] = l[r];
+            }
+        }
+        return;
+    }
+
+    // Normalize and store (token-major); threads sharing a d-slice write
+    // identical values (benign).
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_THREAD; ++r)
+    {
+        uint row = rowBase + r;
+        if (!ROW_VALID(row)) continue;
+        float lInv = (l[r] == 0.0) ? 0.0 : (1.0 / l[r]);
+        [[unroll]] for (uint d = 0u; d < DH4_PER_THREAD; ++d)
+            writeO4(outRow(ROW_TOK(row), ROW_HEAD(row)) * DH4 + d * dhSplit + dhLane,
+                    ((accF16 != 0u) ? vec4(acc16[r * DH4_PER_THREAD + d])
+                                    : acc32[r * DH4_PER_THREAD + d]) * lInv);
+    }
+}

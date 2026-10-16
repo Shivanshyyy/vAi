@@ -1,0 +1,54 @@
+/*=============================================================================
+ slice.comp:
+     O[o, m, i] = I[o, start + m, i]   (a run along one axis, output-driven gather)
+
+ The axis being cut splits the tensor into three flattened extents: outer (the
+ axes ahead of it), the axis itself, and inner (the axes behind it). Only the
+ middle one is narrowed, so the run is strided and a copy cannot do it.
+
+ - Gather (not scatter): each thread owns one OUTPUT element and pulls from the
+   input, so no atomics are needed.
+ - axis 0 never reaches this kernel — there the run is contiguous and the node
+   aliases or copies it on the host side.
+ - O (typeO) and I (typeI) are fp32 or fp16, accessed through same-binding
+   buffer aliases. Dispatch (host): dispatch2(total).
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+
+layout(set = 0, binding = 0) buffer O_BUF_F32 { float bufferO_f32[]; };       // sliced O [outer, count, inner]
+layout(set = 0, binding = 0) buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) buffer I_BUF_F32 { float bufferI_f32[]; };       // input I [outer, axisSize, inner]
+layout(set = 0, binding = 1) buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint inner;      // elements behind the sliced axis, flattened
+    uint count;      // indices taken from the axis
+    uint axisSize;   // the axis as the input has it
+    uint start;      // first index taken
+    uint total;      // output elements
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+void main()
+{
+    uint k = gl_GlobalInvocationID.x;      // one thread per output element
+    if (k >= total) return;
+
+    uint i    = k % inner;
+    uint rest = k / inner;
+    uint m    = rest % count;
+    uint o    = rest / count;
+
+    writeO(k, readI((o * axisSize + start + m) * inner + i));
+}

@@ -1,0 +1,56 @@
+/*=============================================================================
+ index-copy.comp:
+     O[o, index[n], i] = S[o, n, i]   (slices scattered along one axis, in place)
+
+ The axis splits both tensors into outer (the axes ahead of it), the axis, and
+ inner (the axes behind it). Only the source rows move; the rest of O stays.
+
+ - Scatter (not gather): each thread owns one source word, so only the N slices
+   are touched, and an index past axisSize skips its row.
+ - Bytes move as they are, vecWords 4-byte words per thread (uvec4, uvec2 or
+   uint aliases of one binding), the widest that divides a row.
+ - Dispatch (host): dispatch2(rowWords, rows), x across a row, y one source row.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = 0) const uint vecWords = 4;            // 4-byte words per thread
+
+layout(set = 0, binding = 0) buffer O_BUF_V4 { uvec4 bufferO_v4[]; };   // O [outer, axisSize, inner]
+layout(set = 0, binding = 0) buffer O_BUF_V2 { uvec2 bufferO_v2[]; };
+layout(set = 0, binding = 0) buffer O_BUF_V1 { uint  bufferO_v1[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) readonly buffer S_BUF_V4 { uvec4 bufferS_v4[]; };   // source S [outer, count, inner]
+layout(set = 0, binding = 1) readonly buffer S_BUF_V2 { uvec2 bufferS_v2[]; };
+layout(set = 0, binding = 1) readonly buffer S_BUF_V1 { uint  bufferS_v1[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer INDEX_BUF { uint index[]; };       // [count]
+
+layout(push_constant) uniform PushConstants {
+    uint rowWords;   // a row (inner) in vecWords units
+    uint count;      // source indices along the axis
+    uint axisSize;   // the axis as O has it
+    uint rows;       // source rows: outer * count
+};
+
+void main()
+{
+    uint w   = gl_GlobalInvocationID.x;     // word within the row
+    uint row = gl_GlobalInvocationID.y;     // source row
+    if (w >= rowWords || row >= rows) return;
+
+    uint n = row % count;
+    uint o = row / count;
+    uint target = index[n];
+    if (target >= axisSize) return;
+
+    uint s = row * rowWords + w;
+    uint d = (o * axisSize + target) * rowWords + w;
+
+    if (vecWords == 4)      bufferO_v4[d] = bufferS_v4[s];
+    else if (vecWords == 2) bufferO_v2[d] = bufferS_v2[s];
+    else                    bufferO_v1[d] = bufferS_v1[s];
+}

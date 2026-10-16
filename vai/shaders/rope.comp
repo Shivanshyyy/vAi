@@ -1,0 +1,67 @@
+/*=============================================================================
+ rope.comp:
+     RoPE (rotary position embedding), half-split rotation.
+
+ - O (typeO) / I (typeI) [H, Tq, Dh] are fp32 or fp16, accessed through
+   same-binding buffer aliases. The rotation itself is always fp32.
+ - freqs [Dh/2] is always fp32: it is tiny and the angles are precision
+   critical, so it does not follow the parameter dtype.
+ - freqs[d] already carries whatever frequency scaling the model wants; the
+   host precomputes it once (see RopeNode).
+ - Half-split rotation (same as HuggingFace LLaMA):
+     x1 = x[..., :Dh/2]   x2 = x[..., Dh/2:]
+     result = x * cos + rotate_half(x) * sin
+ - The angle is offset by kvCacheCount so a KV-cache decode step continues
+   where the previous forward stopped.
+
+ Dispatch (host): dispatch2(Dh / 2, Tq, H) -- one thread per rotated pair.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#include "common/spec_constants.h"
+
+layout(local_size_x = 32) in;
+
+layout(constant_id = SPEC_ID_TYPE_O) const uint typeO = 0;  // O (output) dtype
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (input) dtype
+
+layout(set = 0, binding = 0) buffer O_BUF_F32 { float bufferO_f32[]; };
+layout(set = 0, binding = 0) buffer O_BUF_F16 { float16_t bufferO_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 1) buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 1) buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+//////////////////////////////////////////////////////////////////////////////
+layout(set = 0, binding = 2) readonly buffer FREQS_BUF { float bufferFreqs[]; };
+layout(set = 0, binding = 3) uniform UB { uint kvCacheCount; };
+
+layout(push_constant) uniform PushConstants {
+    uint H;     // number of heads
+    uint Tq;    // query tokens this forward
+    uint Dh;    // head dimension (even)
+};
+
+float readI(uint i)          { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+void writeO(uint i, float v) { if (typeO == DTYPE_F32) bufferO_f32[i] = v; else bufferO_f16[i] = float16_t(v); }
+
+void main()
+{
+    uint d = gl_GlobalInvocationID.x;    // dimension index (coalesced)
+    uint n = gl_GlobalInvocationID.y;    // position index
+    uint h = gl_GlobalInvocationID.z;    // head index
+
+    uint halfDh = Dh / 2;
+    if (d >= halfDh || n >= Tq || h >= H) return;
+
+    float angle = float(kvCacheCount + n) * bufferFreqs[d];
+    float cos_ = cos(angle);
+    float sin_ = sin(angle);
+
+    uint idx1 = (h * Tq + n) * Dh + d;
+    uint idx2 = idx1 + halfDh;
+    float x1 = readI(idx1);
+    float x2 = readI(idx2);
+
+    writeO(idx1, cos_ * x1 - sin_ * x2);
+    writeO(idx2, sin_ * x1 + cos_ * x2);
+}

@@ -1,0 +1,83 @@
+/*=============================================================================
+ argmax.comp:
+     Row-wise argmax over a [M, N] tensor -> [M] indices (greedy sampling).
+
+  - in   shape : [M, N]  (fp32 logits)
+  - out  shape : [M]     (one raw uint32 index per row)
+
+ Layout
+  - One workgroup per row, 256 threads cooperate on the N-wide reduction.
+  - Each thread scans a strided slice of its row, keeping a local
+    (value, index) pair, then a tree-reduction merges them.
+
+ Output indices are plain uint32 (no packing).
+
+ Dispatch (host)
+  - .dispatch(M) — one workgroup per row.
+=============================================================================*/
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_16bit_storage : require
+#include "common/spec_constants.h"
+
+const uint LOCAL = 256u;
+layout(local_size_x = 256) in;
+
+layout(constant_id = SPEC_ID_TYPE_I) const uint typeI = 0;  // I (logits) dtype
+
+// Input logits (typeI, same-binding aliases); output holds one raw uint32 index per row.
+layout(set = 0, binding = 0) buffer I_BUF_F32 { float bufferI_f32[]; };
+layout(set = 0, binding = 0) buffer I_BUF_F16 { float16_t bufferI_f16[]; };
+layout(set = 0, binding = 1) buffer OUT_IDX   { uint  outIdx[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+};
+
+float readI(uint i) { return (typeI == DTYPE_F32) ? bufferI_f32[i] : float(bufferI_f16[i]); }
+
+shared float sMax[LOCAL];
+shared uint  sIdx[LOCAL];
+
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    if (row >= M) return;
+
+    uint tid  = gl_LocalInvocationID.x;
+    uint base = row * N;
+
+    // Phase 1: per-thread sequential argmax over a strided slice of the row
+    float bestVal = -3.4028235e38;
+    uint  bestIdx = 0u;
+    for (uint i = tid; i < N; i += LOCAL)
+    {
+        float v = readI(base + i);
+        if (v > bestVal)
+        {
+            bestVal = v;
+            bestIdx = i;
+        }
+    }
+    sMax[tid] = bestVal;
+    sIdx[tid] = bestIdx;
+    barrier();
+
+    // Phase 2: parallel tree-reduction (keep the (val, idx) of the larger val)
+    for (uint stride = LOCAL / 2u; stride > 0u; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            if (sMax[tid + stride] > sMax[tid])
+            {
+                sMax[tid] = sMax[tid + stride];
+                sIdx[tid] = sIdx[tid + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) outIdx[row] = sIdx[0];
+}
