@@ -1,6 +1,17 @@
 message(STATUS "[vAi] Configuring Python bindings...")
 
 ################################################################################
+# Compiler — GCC 14 or newer
+################################################################################
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14)
+    message(FATAL_ERROR
+        "[vAi] GCC ${CMAKE_CXX_COMPILER_VERSION} is too old: the core needs GCC 14 or newer (C++23 deducing `this`).\n"
+        "  Remove ${CMAKE_BINARY_DIR} and re-run with the newer compiler, e.g.:\n"
+        "  CC=gcc-14 CXX=g++-14 pip install -e ."
+    )
+endif()
+
+################################################################################
 # Toolchain — Python + nanobind
 ################################################################################
 if(CMAKE_VERSION VERSION_LESS 3.18)
@@ -38,9 +49,8 @@ message(STATUS "[vAi] nanobind: ${nanobind_ROOT}")
 ################################################################################
 # Package output — <build>/python/pyvai
 ################################################################################
-# The importable package (extension + stub + pure-Python files) is assembled
-# here — import via `PYTHONPATH=<build>/python`. No wheel packaging in the
-# experimental release; pyproject.toml keeps the config for later.
+# A direct CMake build assembles the package here (extension, stub, .py files):
+# import it with `PYTHONPATH=<build>/python`. pip goes through the install rules.
 set(PYVAI_PACKAGE_DIR ${CMAKE_CURRENT_BINARY_DIR}/pyvai)
 
 ################################################################################
@@ -48,19 +58,13 @@ set(PYVAI_PACKAGE_DIR ${CMAKE_CURRENT_BINARY_DIR}/pyvai)
 ################################################################################
 file(GLOB_RECURSE PYVAI_SRCS
     CONFIGURE_DEPENDS
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bindings/*.cpp
 )
 
 nanobind_add_module(_pyvai
     NB_STATIC
-    LTO        # link-time optimization on Release builds (no effect on Debug)
+    LTO
     ${PYVAI_SRCS}
-)
-
-# models/... headers resolve via vAi's PUBLIC repo-root include dir; only the bindings' own tree needs adding.
-target_include_directories(_pyvai
-PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_link_libraries(_pyvai
@@ -72,15 +76,13 @@ set_target_properties(_pyvai PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${PYVAI_PACKAGE_DIR}"
 )
 
-# yolov8 — model-local shaders, compiled once under models/ (see models/CMakeLists.txt).
-add_dependencies(_pyvai yolov8-shaders)
+# Model-local shaders are compiled once under models/ (see models/CMakeLists.txt).
+add_dependencies(_pyvai yolox-shaders)
 
 ################################################################################
 # Package assembly — pure-Python files
 ################################################################################
-# Copy the .py files (and py.typed) next to the extension — a complete
-# importable pyvai/ in the build tree. Per-file copy: incremental, and never
-# picks up dev leftovers (__pycache__ etc.).
+# Per file, so the copy is incremental and never picks up __pycache__.
 file(GLOB_RECURSE PYVAI_PY_FILES
     CONFIGURE_DEPENDS
     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/pyvai
@@ -115,9 +117,8 @@ nanobind_add_stub(_pyvai_stub
 ################################################################################
 # Install rules — pip install -e . (scikit-build-core)
 ################################################################################
-# Active only when scikit-build-core drives the build (pip); direct CMake dev
-# builds ignore them. Pure-Python files come straight from the source tree
-# (pyproject wheel.packages), so only the extension + stub install here.
+# The .py files come from the source tree (pyproject wheel.packages), so only
+# the extension and the stub install here.
 if(SKBUILD)
     install(TARGETS _pyvai LIBRARY DESTINATION ${SKBUILD_PROJECT_NAME}
             COMPONENT python)

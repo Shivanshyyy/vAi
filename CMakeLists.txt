@@ -149,7 +149,6 @@ if(VAI_BUILD_BENCH)
     message(STATUS "[vAi] Building benchmark projects...")
 
     # Vision benchmarks
-    add_subdirectory(benchmarks/yolov8)
     add_subdirectory(benchmarks/yolox)
 
     # LLM benchmarks

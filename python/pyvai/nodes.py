@@ -1,25 +1,12 @@
-"""Concrete graph node classes for building vAi models.
+"""The built-in graph nodes, re-exported from the extension module.
 
-The C extension exposes nodes as `IdentityNode`, `LinearNode`, ... here we
-re-export them under the `pyvai.nodes` namespace so they can be addressed
-together:
+Base classes (`Node`, `NodeGroup`, ...), `KVCacheCounter` and the config types
+(`Epilogue`, `ResidualOrder`, `RopeType`, `RopeConfig`) stay at the top level of
+`pyvai`.
 
-    from pyvai import nodes
-
-    class Net(pyvai.NeuralNet):
-        def __init__(self):
-            super().__init__()
-            self.fc = nodes.LinearNode(in_dim=128, out_dim=64)
-
-Base classes (`Node`, `NodeGroup`, ...), state objects (`KVCacheCounter`),
-and config enums (`Epilogue`) stay at the top-level `pyvai` namespace.
-
-Adding a builtin node touches five sites — keep them in sync:
-  1. src/bindings/nodes/bind-vai-<node>.cpp   (the `bindXxx` definition)
-  2. src/bindings/nodes/bind-nodes.h          (its declaration)
-  3. src/bindings/nodes/bind-nodes.cpp        (the `bindNodes` call, ordered)
-  4. this file's `from ._pyvai import (...)`   (re-export)
-  5. this file's `__all__`
+A new node is bound in bindings/nodes/<node>.cpp, declared in nodes.h, called
+from nodes.cpp and re-exported here (the import list and `__all__`;
+tests/test_nodes.py fails if one is missing).
 """
 from ._pyvai import (
     # shape / plumbing
@@ -30,11 +17,14 @@ from ._pyvai import (
     ConcatNode,
     PermuteNode,
     SliceNode,
+    RowSliceScatterNode,
+    IndexCopyNode,
     TypeCastNode,
     # element-wise
     AddNode,
     MulNode,
     GatedMulNode,
+    EleAffineNode,
     ActivationNode,
     # vision
     ConvolutionNode,
@@ -48,6 +38,8 @@ from ._pyvai import (
     BatchNormNode,
     # transformer
     TokenEmbeddingNode,
+    TimeEmbeddingNode,
+    CyclicTableReaderNode,
     RopeNode,
     AttentionNode,
     # output heads
@@ -64,10 +56,13 @@ __all__ = [
     "ConcatNode",
     "PermuteNode",
     "SliceNode",
+    "RowSliceScatterNode",
+    "IndexCopyNode",
     "TypeCastNode",
     "AddNode",
     "MulNode",
     "GatedMulNode",
+    "EleAffineNode",
     "ActivationNode",
     "ConvolutionNode",
     "MaxPool2dNode",
@@ -78,6 +73,8 @@ __all__ = [
     "RmsNormNode",
     "BatchNormNode",
     "TokenEmbeddingNode",
+    "TimeEmbeddingNode",
+    "CyclicTableReaderNode",
     "RopeNode",
     "AttentionNode",
     "ArgmaxNode",

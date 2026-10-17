@@ -1,8 +1,7 @@
-from typing import Protocol
-
 from ._pyvai import (
     init_vai_engine,
     get_vai_device,
+    seed,
     Device,
     Dtype,
     Tensor,
@@ -13,42 +12,37 @@ from ._pyvai import (
     OutputNode,
     NodeFlow,
     Epilogue,
+    ResidualOrder,
+    RopeType,
+    RopeConfig,
     KVCacheCounter,
     NeuralNet,
     Tokenizer,
+    ImageProcessor,
+    ImageGeometry,
+    Resize,
+    Align,
 )
-from ._pyvai import SafetensorsParser, SafetensorRef
+from .weights import Weights, TensorInfo
 from . import nodes
 from . import models
 
 
-class _WeightStore(Protocol):
-    """Duck-typed interface returned by `parse_weight`. Concrete parsers
-    (e.g. `_pyvai.SafetensorsParser`) satisfy this without subclassing."""
-    def tensor_names(self) -> list[str]: ...
-    def __getitem__(self, key: str) -> Tensor: ...
+# The Dtype members under their torch/numpy names.
+float32 = Dtype.F32
+float16 = Dtype.F16
 
 
-def parse_weight(path: str, format: str = "safetensors") -> _WeightStore:
-    """Parse a weights file into an inspectable store.
-
-    The returned store (e.g. a `SafetensorsParser`) exposes `tensor_names()`
-    and `__getitem__(key) -> Tensor` for inspecting a file's tensors. To load
-    weights into a model, pass the path straight to `model.load_weight(path)`.
-    Add formats by extending the dispatch below.
-    """
-    if format == "safetensors":
-        return SafetensorsParser(path)
-    raise ValueError(f"parse_weight: unsupported format '{format}'")
-
-
-# Single source of the package version — pyproject.toml reads it via regex.
-__version__: str = "0.1.0"
+# The package version's single source; pyproject.toml reads it by regex.
+__version__: str = "v0.0.0"
 __all__ = [
     "init_vai_engine",
     "get_vai_device",
+    "seed",
     "Device",
     "Dtype",
+    "float32",
+    "float16",
     "Tensor",
     "Node",
     "NodeSlot",
@@ -57,12 +51,18 @@ __all__ = [
     "OutputNode",
     "NodeFlow",
     "Epilogue",
+    "ResidualOrder",
+    "RopeType",
+    "RopeConfig",
     "KVCacheCounter",
     "NeuralNet",
     "Tokenizer",
-    "SafetensorsParser",
-    "SafetensorRef",
+    "ImageProcessor",
+    "ImageGeometry",
+    "Resize",
+    "Align",
+    "Weights",
+    "TensorInfo",
     "nodes",
     "models",
-    "parse_weight",
 ]

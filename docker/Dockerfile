@@ -56,12 +56,17 @@ FROM base AS dev
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Toolchain + full SDK (glslc); the LunarG repo list is inherited from base.
+# The core uses C++23 the distro's default g++ 13 does not have, so GCC 14 it
+# is, for cmake and for the pip build alike.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates git \
-        build-essential g++ cmake ninja-build \
+        build-essential gcc-14 g++-14 cmake ninja-build \
         python3 python3-dev \
     && apt-get install -y vulkan-sdk \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-14 \
+    CXX=g++-14
 
 COPY --from=uv /uv /uvx /bin/
 
