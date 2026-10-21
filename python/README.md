@@ -3,7 +3,7 @@
 ![status](https://img.shields.io/badge/status-experimental-orange)
 ![python](https://img.shields.io/badge/python-3.9--3.14-blue)
 ![backend](https://img.shields.io/badge/backend-Vulkan%201.3-red)
-![license](https://img.shields.io/badge/license-MIT-blue)
+![license](https://img.shields.io/badge/license-Apache%202.0-blue)
 
 <!-- Once published, swap the static badges above for dynamic ones:
 ![PyPI](https://img.shields.io/pypi/v/pyvai)
@@ -175,4 +175,4 @@ The graph builder is exposed as well: subclass `pyvai.NeuralNet`, instantiate no
 
 ## License
 
-[MIT](../LICENSE), same as the parent vAi repository.
+[Apache 2.0](../LICENSE), same as the parent vAi repository. Model weights and external dependencies retain their respective licenses.

@@ -1,19 +1,18 @@
 # vAi
 
-**DAG 기반 Vulkan 추론 엔진.** 학습된 신경망을 연산 노드의 그래프로 조립하고
-Vulkan compute shader 위에서 실행합니다. Vulkan conformant GPU라면 벤더와 무관하게
-같은 코드가 돕니다.
+**A cross-platform AI inference engine on Vulkan.** It runs a range of models, including vision, language and multimodal models, in one C++ runtime. Model structure and weight mappings are defined in code, with support for adding operators and GPU kernels.
 
-<!-- TODO: 데모 GIF (llama3 토큰 스트리밍 / yolov8 검출 결과) — docs/assets/ 에 둘 것 -->
+The graph below defines an MNIST model. The `ConvSequence` definition and weight loading code are in the [full example](examples/mnist/main.cpp).
 
 ```cpp
 struct Model : public vai::NeuralNet {
     ConvSequence convX2;
-    vai::FlattenNode flatten;
-    vai::LinearNode linear;
+    vai::node::Flatten flatten;
+    vai::node::Linear linear;
 
     Model(const vai::NeuralNetConfig& cfg)
-    : NeuralNet(cfg), convX2({1, 32, 64}, 3), linear({7 * 7 * 64, 10})
+    : NeuralNet(cfg), convX2({1, 32, 64}, 3)
+    , linear({.inDim = 7 * 7 * 64, .outDim = 10, .hasBias = true})
     {
         input("in0") - convX2 - flatten - linear - output("out0");
     }
@@ -21,59 +20,64 @@ struct Model : public vai::NeuralNet {
 ```
 
 ```cpp
-Tensor output = model({{"in0", input}})["out0"];
+vai::Tensor output;
+model({{"in0", input}}, {{"out0", &output}});
 ```
 
-## 특징
+## Features
 
-- **벤더 무관** — NVIDIA · AMD · Intel 어디서든 같은 SPIR-V. CUDA도 벤더 런타임도 필요 없음
-- **모델 포맷 없음** — 그래프가 곧 C++ 코드. 변환 도구를 거치지 않음
-- **커널 다중 경로** — 형상과 장치에 따라 협조 행렬 / 스칼라 / 폴백 커널을 자동 선택
-- **KV 캐시 융합 어텐션** — 캐시 append와 causal attention이 한 커널. GQA · 슬라이딩 윈도우 · split-K 디코드 지원
-- **SafeTensors 직접 로드** — HuggingFace 체크포인트를 그대로 읽음
-- **빌트인 노드 27종** — [레퍼런스](docs/ko/06-nodes.md)
+- Portability: Vulkan provides a common execution layer, so supported GPUs use the same model code and API.
+- Execution efficiency: GPU commands are reused while execution conditions remain unchanged, reducing repeated CPU work. Kernels are selected for the input shape and device.
+- Flexibility: Nodes manage state that changes during inference, such as the KV cache, so one runtime can handle vision models, LLMs, VLMs and VLAs.
+- Intuitiveness: Operators are declared as C++ members and connected with `-`, expressing model structure and data flow in code.
+- Extensibility: Node subclasses can add [operators and GPU kernels](docs/en/07-contributing-nodes.md) without modifying the engine core.
 
-## 제공 모델
+## Supported models
 
-| 모델 | 종류 | 문서 |
+Size presets and weight loaders are covered in the [model list](docs/en/04-models/README.md#list).
+
+| Model | Task | Example |
 |---|---|---|
-| MNIST | 이미지 분류 | [빠른 실행](docs/ko/02-quickstart.md) |
-| YOLOv8 | 객체 검출 | [yolov8.md](docs/ko/04-models/yolov8.md) |
-| YOLOX | 객체 검출 | [yolox.md](docs/ko/04-models/yolox.md) |
-| GPT-2 124M | 언어 모델 | [gpt2.md](docs/ko/04-models/gpt2.md) |
-| Llama 3.2 1B | 언어 모델 | [llama3.md](docs/ko/04-models/llama3.md) |
+| MNIST | Image classification | [Quick Start](docs/en/02-quickstart.md) |
+| YOLOX | Object detection | [demo.cpp](examples/yolox/demo.cpp) |
+| GPT-2 | Text generation | [demo.cpp](examples/gpt2/demo.cpp) |
+| Llama 3.2 | Text generation / multi-turn chat | [demo.cpp](examples/llama3/demo.cpp), [chat.cpp](examples/llama3/chat.cpp) |
+| Gemma 3 | Text generation / multi-turn chat (text and image input) | [demo.cpp](examples/gemma3/demo.cpp), [chat.cpp](examples/gemma3/chat.cpp) |
+| PaliGemma | Text generation from image and text input | [demo.cpp](examples/paligemma/demo.cpp) |
+| π0 | Action chunks from images, instructions and state | [demo.cpp](examples/pi0/demo.cpp) |
+| π0.5 | Action chunks from images, instructions and state | [demo.cpp](examples/pi05/demo.cpp) |
 
-## 빌드
+## Build
 
-Vulkan SDK, CMake 3.16+, C++23 컴파일러가 필요합니다.
+Requires the Vulkan development libraries and `glslc` (Vulkan SDK), CMake 3.16+ and a C++23 compiler (GCC 14+ on Linux), with Make or Ninja. The default build produces only the library. On Linux, prefix the configure command with `CC=gcc-14 CXX=g++-14` to select GCC 14.
 
 ```bash
-git clone --recursive https://github.com/<owner>/vAi.git
+git clone --recursive https://github.com/vaistrata/vAi.git
 cd vAi
-cmake -B build -DVAI_BUILD_MODEL_TESTS=ON
-cmake --build build --config RelWithDebInfo
-./build/bin/test-model-mnist
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
 
-체크포인트는 저장소에 없습니다. 자세한 내용은
-[빠른 실행](docs/ko/02-quickstart.md) 참조.
+`VAI_BUILD_EXAMPLES`, `VAI_BUILD_TESTS`, `VAI_BUILD_BENCH` and `VAI_BUILD_PYTHON` all default to `OFF`.
 
-## 문서
+## Documentation
 
-| 장 | 내용 |
+| Section | Contents |
 |---|---|
-| [개요](docs/ko/index.md) | 특징, 프로젝트 구조 |
-| [빠른 실행](docs/ko/02-quickstart.md) | 설치, 최소 예제 |
-| [vAi 사용법](docs/ko/03-usage/README.md) | 노드 · 노드그룹 · NeuralNet · Tensor |
-| [제공 모델](docs/ko/04-models/README.md) | 모델별 설명과 성능 |
-| [커스텀 모델 작성](docs/ko/05-contributing-models.md) | 새 모델 올리기 |
-| [제공 노드들](docs/ko/06-nodes.md) | 빌트인 노드 레퍼런스 |
-| [커스텀 노드와 커널 작성](docs/ko/07-contributing-nodes.md) | 새 연산 추가하기 |
+| [Overview](docs/en/index.md) | Features and project structure |
+| [Quick Start](docs/en/02-quickstart.md) | Build requirements and limitations, MNIST example |
+| [Using vAi](docs/en/03-usage/README.md) | Node, NodeGroup, NeuralNet and Tensor |
+| [Supported models](docs/en/04-models/README.md) | Implemented presets, examples and weight loaders |
+| [Writing custom models](docs/en/05-contributing-models.md) | Adding a model |
+| [Built-in nodes](docs/en/06-nodes.md) | Node reference |
+| [Writing custom nodes and kernels](docs/en/07-contributing-nodes.md) | Adding an operator |
 
-## 성능
+## Performance
 
-> 측정값 미기입 — [통합 벤치마크](docs/ko/04-models/README.md#통합-벤치마크) 참조.
+See the [benchmark documentation](docs/en/04-models/README.md#aggregate-benchmark) for each model's
+measurement environment and results. Comparisons require matching GPUs, precision,
+input sizes and timing boundaries.
 
-## 라이선스
+## License
 
-[MIT](LICENSE)
+The engine code is licensed under [Apache 2.0](LICENSE). Model weights and external dependencies retain their respective licenses.

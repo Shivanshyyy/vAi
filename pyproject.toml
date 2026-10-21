@@ -14,7 +14,7 @@ name            = "pyvai"
 dynamic         = ["version"]                       # single-sourced from python/pyvai/__init__.py
 description     = "Python bindings for the vAi engine"
 readme          = "python/README.md"
-license         = { text = "MIT" }                  # same as the repo-root LICENSE
+license         = { text = "Apache-2.0" }           # same as the repo-root LICENSE
 authors         = [{ name = "vAi-Strata" }]
 keywords        = ["vulkan", "inference", "neural-network", "gpu", "nanobind"]
 requires-python = ">=3.9,<3.15"
