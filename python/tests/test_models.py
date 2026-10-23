@@ -1,107 +1,221 @@
-"""Built-in models: config presets (no GPU), MNIST end-to-end (weights ship
-in-repo), and the YOLO pre/post-processing functions."""
+"""Built-in models and their wrappers, without any checkpoint: boundaries,
+presets, setup errors, YOLOX postprocessing, and the completion / chat logic
+on a stub model and a byte-level stub tokenizer.
+"""
 import numpy as np
 import pytest
 
 import pyvai
 from pyvai.models import (
-    GPT2Config, Llama3Config, MNIST, MNISTModel,
-    yolov8_preprocess, yolov8_postprocess,
+    GPT2, GPT2Config, GPT2Model, Llama3Config, Llama3Model,
+    Gemma3Config, Gemma3Model, PaliGemmaConfig, PaliGemmaModel, Pi0Config, Pi0Model,
+    Pi05Config, Pi05Model,
+    YOLOX, YOLOXModel, YOLOXTier, YOLOXDetection, yolox_postprocess,
+    ChatSession, LLAMA3_CHAT_TEMPLATE,
 )
+from pyvai.models._causal_lm import _CausalLM
 
 
 # ---------------------------------------------------------------------------
-# Configs
+# Bound models — what the bindings declare about them
 # ---------------------------------------------------------------------------
 
-def test_gpt2_config_124m():
-    c = GPT2Config._124M()
-    assert (c.vocab_size, c.max_trained_context, c.embed_dim, c.num_heads, c.num_layers) \
-        == (50257, 1024, 768, 12, 12)
-    assert c.name == "124M"
+def test_all_models_declare_boundaries():
+    """A bound NeuralNet subclass builds its graph in C++, out of sight of the
+    Python input()/output() wrappers, so its binding must declare the names."""
+    bound = [cls for name, cls in vars(pyvai._pyvai).items()
+             if isinstance(cls, type) and issubclass(cls, pyvai.NeuralNet)
+             and cls is not pyvai.NeuralNet]
+    assert {c.__name__ for c in bound} >= {"GPT2Model", "Llama3Model",
+                                           "Gemma3Model", "PaliGemmaModel", "Pi0Model",
+                                           "Pi05Model", "YOLOXModel"}
+    for cls in bound:
+        ins, outs = cls._pyvai_io
+        assert ins and outs, f"{cls.__name__} declares no boundaries"
+    for cls in (GPT2Model, Llama3Model):
+        assert cls._pyvai_io == (("inTokenIds",), ("nextTokenId",))
+    assert Gemma3Model._pyvai_io == (("inImages", "inTokenIds"), ("nextTokenId",))
+    assert PaliGemmaModel._pyvai_io == (("inImage", "inTokenIds"), ("nextTokenId",))
+    assert Pi0Model._pyvai_io == (
+        ("inImages", "inPromptTokens", "inState", "inStateToken", "inActions"),
+        ("outStateToken", "outActions"))
+    assert Pi05Model._pyvai_io == (("inImages", "inPromptTokens", "inActions"), ("outActions",))
 
 
-def test_llama3_config_3_2_1b():
-    c = Llama3Config._3_2_1B()
-    assert (c.vocab_size, c.embed_dim, c.num_heads, c.num_kv_heads,
-            c.num_layers, c.ffn_hidden_dim) == (128256, 2048, 32, 8, 16, 8192)
-    assert c.name == "3.2-1B"
+@pytest.mark.parametrize("cls, expected", [
+    (GPT2Config,   ["124M", "355M", "774M", "1.5B"]),
+    (Llama3Config, ["3.2-1B", "3.2-3B"]),
+    (Gemma3Config, ["270M", "1B", "4B", "12B"]),
+    (PaliGemmaConfig, ["3B-224", "3B-448"]),
+    (Pi0Config, ["3B"]),
+    (Pi05Config, ["3B"]),
+])
+def test_config_presets(cls, expected):
+    """preset(variant) covers exactly the variants `presets` lists and returns a
+    fresh object each call, nested configs included; other names raise."""
+    assert cls.presets == expected
+    for variant in expected:
+        assert cls.preset(variant).variant == variant
+    a, b = cls.preset(expected[0]), cls.preset(expected[0])
+    a.language_cfg.layer_cfg.embed_dim = 1
+    assert a.language_cfg.layer_cfg.embed_dim == 1      # nested edits land in place
+    assert b.language_cfg.layer_cfg.embed_dim != 1
+    with pytest.raises(ValueError, match="unknown variant"):
+        cls.preset("nope")
 
 
-# ---------------------------------------------------------------------------
-# MNIST — the one model whose checkpoint ships in-repo
-# ---------------------------------------------------------------------------
-
-def _weights(data_dir):
-    p = data_dir / "mnist" / "model.safetensors"
-    if not p.exists():
-        pytest.skip(f"missing weights: {p}")
-    return str(p)
-
-
-def _digit_image(data_dir, digit):
-    Image = pytest.importorskip("PIL.Image")
-    p = data_dir / "mnist" / f"{digit}.png"
-    if not p.exists():
-        pytest.skip(f"missing image: {p}")
-    return np.asarray(Image.open(p).convert("L"), dtype=np.uint8)   # (28, 28)
-
-
-@pytest.fixture(scope="module")
-def mnist(data_dir):
-    return MNIST().load_weights(_weights(data_dir))
-
-
-@pytest.mark.parametrize("digit", [0, 9])
-def test_wrapper_predicts_digit(mnist, data_dir, digit):
-    assert mnist.predict(_digit_image(data_dir, digit)) == digit
-
-
-def test_bound_matches_wrapper(mnist, data_dir):
-    """MNISTModel (raw dict-in/out) and the MNIST wrapper agree."""
-    img = _digit_image(data_dir, 9)
-
-    bound = MNISTModel()
-    bound.load_weight(_weights(data_dir))
-    chw = (img.astype(np.float32) / 255.0)[np.newaxis, :, :]
-    logits = bound({"in0": pyvai.Tensor.from_numpy(chw, dtype=pyvai.Dtype.F32)})["out0"].to_numpy()
-
-    assert int(np.argmax(logits)) == mnist.predict(img) == 9
-
-
-def test_load_weight_missing_file_raises():
+def test_model_setup_errors():
+    """A missing checkpoint is a FileNotFoundError; the wrappers refuse a forward
+    before load_weights(), which would die in the driver."""
     with pytest.raises(FileNotFoundError):
-        MNISTModel().load_weight("does-not-exist.safetensors")
+        YOLOXModel(YOLOXTier.SMALL).load_weights("does-not-exist")
+    with pytest.raises(RuntimeError, match="load_weights"):
+        YOLOX(tier=YOLOXTier.SMALL).detect(np.zeros((8, 8, 3), dtype=np.uint8))
+    with pytest.raises(RuntimeError, match="load_tokenizer"):
+        GPT2(max_runtime_context=8).generate("x")
 
 
-# ---------------------------------------------------------------------------
-# YOLO pre/post-processing (pure functions — no GPU or weights)
-# ---------------------------------------------------------------------------
-
-def test_preprocess_letterbox_shape_and_range():
-    w = h = 4
-    target = 32
-    image = np.full(w * h * 3, 128, dtype=np.uint8)  # flat HWC RGB
-    out = np.asarray(yolov8_preprocess(image, w, h, target), dtype=np.float32)
-    assert out.shape == (3 * target * target,)      # CHW float
-    assert out.min() >= 0.0 and out.max() <= 1.0    # normalized to [0, 1]
-
-
-def test_postprocess_argmax_and_class_mapping():
-    # [x1, y1, x2, y2, cls0..cls79] for one anchor; class 2 (car) is the argmax.
-    data = np.zeros(84, dtype=np.float32)
-    data[:4] = [10.0, 20.0, 30.0, 40.0]
-    data[4 + 0], data[4 + 2] = 0.3, 0.8
-    dets = yolov8_postprocess(data, 0.25, 0.45)
+def test_yolox_postprocess_maps_boxes_back_and_checks_size():
+    """One anchor: confidence = objectness * class score, the box mapped back to
+    the source through the geometry and clipped; a bad row width is refused."""
+    data = np.zeros(85, dtype=np.float32)
+    data[:5] = [100.0, 60.0, 40.0, 20.0, 0.9]     # cx, cy, w, h, objectness
+    data[5 + 16] = 0.8                             # dog
+    geometry = pyvai.ImageGeometry(source_width=100, source_height=50, scale_x=2.0, scale_y=2.0)
+    dets = yolox_postprocess(data, geometry, 0.25, 0.45)
     assert len(dets) == 1
     d = dets[0]
-    assert (d.x1, d.y1, d.x2, d.y2) == (10.0, 20.0, 30.0, 40.0)
-    assert d.class_id == 2 and d.class_name == "car"
-    assert abs(d.confidence - 0.8) < 1e-6
+    assert (d.x1, d.y1, d.x2, d.y2) == (40.0, 25.0, 60.0, 35.0)
+    assert d.class_id == 16 and d.class_name == "dog" and abs(d.confidence - 0.72) < 1e-6
+    assert isinstance(d, YOLOXDetection)
+    assert yolox_postprocess(data, geometry, 0.75, 0.45) == []              # below threshold
+    geometry.source_width = 45
+    assert yolox_postprocess(data, geometry, 0.25, 0.45)[0].x2 == 45.0      # clipped to width
+    geometry.pad_x = 20.0
+    assert yolox_postprocess(data, geometry, 0.25, 0.45)[0].x1 == 30.0      # (80 - 20) / 2
+    for bad in (np.zeros(84, dtype=np.float32), np.zeros(0, dtype=np.float32)):
+        with pytest.raises(ValueError, match="multiple of 85"):
+            yolox_postprocess(bad, geometry, 0.25, 0.45)
+    geometry.scale_x = 0.0
+    with pytest.raises(ValueError, match="scale"):
+        yolox_postprocess(data, geometry, 0.25, 0.45)
 
 
-def test_inference_without_weights_raises(data_dir):
-    """A forward before load_weights() dies in the driver, so the wrapper
-    refuses it (the bound *Model classes stay unguarded)."""
-    with pytest.raises(RuntimeError, match="load_weights"):
-        MNIST().predict(np.zeros((28, 28), dtype=np.uint8))
+# ---------------------------------------------------------------------------
+# Completion and chat — the pure-Python layers, on stubs
+#
+# The stub tokenizer is byte-level: a text token is one UTF-8 byte (id < 256)
+# and special pieces get ids from 256 up, concatenative like the real BPE ones.
+# ---------------------------------------------------------------------------
+
+_SPECIAL = {"<|begin_of_text|>": 256, "<|eot_id|>": 257, "<|end_of_text|>": 258,
+            "<|eom_id|>": 259, "<|endoftext|>": 260}
+
+
+class _StubTokenizer:
+    def encode(self, text, add_special=False, parse_special=True):
+        ids, i = [], 0
+        while i < len(text):
+            for piece, pid in _SPECIAL.items():
+                if text.startswith(piece, i):
+                    ids.append(pid)
+                    i += len(piece)
+                    break
+            else:
+                ids.extend(text[i].encode("utf-8"))
+                i += 1
+        return ids
+
+    def decode_bytes(self, ids, skip_special=True):
+        return bytes(i for i in ids if i < 256)
+
+    def decode(self, ids, skip_special=True):
+        return self.decode_bytes(ids).decode("utf-8", errors="replace")
+
+    def piece_to_id(self, piece):
+        return _SPECIAL.get(piece, -1)
+
+
+class _StubModel:
+    """Replays `script`, one id per prefill / decode, counting cached tokens as
+    the C++ models do and logging every call's ids in `calls`."""
+    def __init__(self, script, budget=64):
+        self.script = list(script)
+        self.max_runtime_context = budget
+        self.tokens_so_far = 0
+        self.calls = []
+
+    def load_weights(self, path):
+        pass
+
+    def reset_cache(self):
+        self.tokens_so_far = 0
+
+    def _sample(self):
+        return pyvai.Tensor.from_u32([self.script.pop(0) if self.script else ord("z")])
+
+    def prefill(self, tokens):
+        ids = tokens.to_u32().tolist()
+        self.calls.append(ids)
+        self.tokens_so_far += len(ids)
+        return self._sample()
+
+    def decode(self, token):
+        self.calls.append(token.to_u32().tolist())
+        self.tokens_so_far += 1
+        return self._sample()
+
+
+class _StubLM(_CausalLM):
+    _bos_piece = "<|begin_of_text|>"
+    _eos_pieces = ("<|eot_id|>", "<|end_of_text|>")
+
+
+def _lm(script, budget=64):
+    lm = _StubLM(_StubModel(script, budget))
+    lm.load_weights("stub")
+    lm.tokenizer = _StubTokenizer()
+    return lm
+
+
+def test_iter_tokens_semantics():
+    """One prefill (with BOS on a fresh context) then one forward per token;
+    max_new_tokens caps the count, 0 prefills only; reset_cache=False
+    continues the context without a BOS; a stop id ends the run unyielded."""
+    lm = _lm(list(b"abc") + [_SPECIAL["<|eot_id|>"], *b"xyz"])
+    assert list(lm.iter_tokens("hi", max_new_tokens=2)) == list(b"ab")
+    assert lm.model.calls == [[256, *b"hi"], [ord("a")]]        # BOS + prompt, then one token
+    assert lm.tokens_so_far == 3 + 1
+
+    lm.model.calls.clear()
+    assert list(lm.iter_tokens("!", max_new_tokens=0, reset_cache=False)) == []
+    assert lm.model.calls == [[ord("!")]] and lm.tokens_so_far == 5   # continued, no BOS
+
+    assert list(lm.iter_tokens("?", max_new_tokens=None, reset_cache=False)) == []   # eot first
+    assert lm.tokens_so_far == 6   # the stop id was not cached
+
+    assert list(lm.iter_tokens("!", max_new_tokens=3)) == list(b"xyz")
+    assert lm.model.calls[-1] == [ord("y")]                   # no forward after the last yield
+
+
+def test_chat_session_turns():
+    """Each turn prefills only its delta on the continuing cache; a reply stops
+    on an end-of-generation id, messages are logged, and reset() empties everything."""
+    eot = _SPECIAL["<|eot_id|>"]
+    lm = _lm([*b"Paris", eot, *b"Madrid", eot], budget=512)
+    chat = ChatSession(lm, LLAMA3_CHAT_TEMPLATE)
+    assert chat.max_new_tokens is None and chat.messages == []
+
+    assert chat.send("capital of France?") == "Paris"
+    first_prefill = lm.model.calls[0]
+    assert first_prefill[0] == 256 and first_prefill.count(256) == 1   # BOS once, from the template
+    assert [m["role"] for m in chat.messages] == ["user", "assistant"]
+    after_first = lm.tokens_so_far
+
+    assert "".join(chat.stream("and Spain?", max_new_tokens=3)) == "Mad"
+    assert lm.model.calls[-3][0] == eot   # the turn opened by closing the reply
+    assert lm.tokens_so_far > after_first and chat.messages[-1]["content"] == "Mad"
+    assert chat.context_left == 512 - lm.tokens_so_far
+
+    chat.reset()
+    assert chat.messages == [] and lm.tokens_so_far == 0

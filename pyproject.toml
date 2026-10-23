@@ -1,10 +1,9 @@
 [build-system]
-# nanobind 3.0 dropped Python 3.9 (its wheel still installs there, then
-# refuses to import), so 3.9 must stay on the 2.x line.
+# nanobind 3 dropped Python 3.9; <4 is the last major verified.
 requires = [
     "scikit-build-core>=0.10",
     "nanobind>=2.0,<3; python_version < '3.10'",
-    "nanobind>=2.0;    python_version >= '3.10'",
+    "nanobind>=2.0,<4; python_version >= '3.10'",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -15,7 +14,7 @@ dynamic         = ["version"]                       # single-sourced from python
 description     = "Python bindings for the vAi engine"
 readme          = "python/README.md"
 license         = { text = "Apache-2.0" }           # same as the repo-root LICENSE
-authors         = [{ name = "vAi-Strata" }]
+authors         = [{ name = "vAiStrata" }]
 keywords        = ["vulkan", "inference", "neural-network", "gpu", "nanobind"]
 requires-python = ">=3.9,<3.15"
 classifiers = [
@@ -33,7 +32,6 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.20",
-    "Pillow",       # the examples' image I/O — pyvai itself never imports it
 ]
 
 [project.optional-dependencies]
